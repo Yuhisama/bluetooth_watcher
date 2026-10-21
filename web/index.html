@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>藍牙擷取工具</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header><h1>藍牙擷取工具</h1><span id="host-status"></span></header>
+<main>
+  <aside>
+    <section class="panel" id="conn">
+      <h2>儀表連線 <span id="conn-badge" class="badge unknown">未測試</span></h2>
+      <div class="mark-row">
+        <input id="conn-host" placeholder="root@192.168.7.1">
+        <button id="btn-conn-test">測試連線</button>
+      </div>
+      <div id="conn-result"></div>
+    </section>
+    <section class="panel" id="control">
+      <h2>擷取控制</h2>
+      <label>測試情境
+        <select id="scenario"></select>
+      </label>
+      <label>App
+        <select id="app">
+          <option>客戶App</option>
+          <option>nRF Connect</option>
+          <option>系統設定</option>
+        </select>
+      </label>
+      <label>手機
+        <input id="phone" list="phones" placeholder="例如 Galaxy M32 / iPhone">
+        <datalist id="phones"></datalist>
+      </label>
+      <div class="buttons">
+        <button id="btn-start" class="primary">開始擷取</button>
+        <button id="btn-stop" class="danger" disabled>停止</button>
+      </div>
+      <div class="mark-row">
+        <input id="mark-text" placeholder="標記說明，例如：畫面卡在連線中" disabled>
+        <button id="btn-mark" disabled>標記</button>
+      </div>
+      <div id="state" class="state idle">閒置</div>
+      <pre id="log"></pre>
+    </section>
+    <section class="panel">
+      <h2>擷取紀錄</h2>
+      <ul id="captures"></ul>
+    </section>
+  </aside>
+  <section id="result" class="panel">
+    <p class="hint">選擇左側的擷取紀錄以檢視結果。</p>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
