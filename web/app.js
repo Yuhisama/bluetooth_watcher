@@ -23,9 +23,14 @@ const CATEGORY = {
   att_discovery: { label: "ATT 探索", color: "#546e7a" },
   att_capability: { label: "ATT 能力限制", color: "#ad6800" },
   cccd: { label: "CCCD", color: "#ef6c00" },
+  gatt_write: { label: "GATT 寫入", color: "#283593" },
+  notify: { label: "Notify", color: "#9e9d24" },
   error: { label: "錯誤", color: "#d50000" },
   mark: { label: "標記", color: "#f9a825" },
 };
+
+// 數量多的類別預設不勾選，也不畫在時間軸（時間軸已有 notify/s 長條）
+const DEFAULT_OFF = new Set(["notify"]);
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -41,6 +46,8 @@ let downloadCaptureId = null;
 let downloadFiles = [];
 let archiveSaveFile = null;
 let archiveBusy = false;
+let captureOperation = null;
+let forceClosing = false;
 
 async function api(path, body) {
   const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
@@ -82,8 +89,9 @@ function fmtOffset(sec) {
 function applyState(s) {
   state = s.state;
   const capturing = state === "capturing";
-  $("btn-start").disabled = capturing;
-  $("btn-stop").disabled = !capturing;
+  $("btn-start").disabled = capturing || !!captureOperation || forceClosing;
+  $("btn-stop").disabled = !capturing || !!captureOperation || forceClosing;
+  $("btn-force-stop").disabled = forceClosing || (!capturing && !captureOperation);
   $("btn-mark").disabled = !capturing;
   $("mark-text").disabled = !capturing;
   for (const id of ["scenario", "app", "phone"]) $(id).disabled = capturing;
@@ -109,32 +117,64 @@ async function poll() {
 }
 
 async function start() {
+  const operation = {};
+  captureOperation = operation;
   busy(true);
   log("開始擷取…（SSH 連線、拍金鑰快照、啟動 btmon）");
   try {
     const r = await api("/api/start", { scenario: $("scenario").value, app: $("app").value, phone: $("phone").value });
+    if (captureOperation !== operation) return;
     log("已開始: " + r.output);
     localStorage.setItem("phone", $("phone").value);
   } catch (e) {
-    log("開始失敗: " + e.message);
+    if (captureOperation === operation) log("開始失敗: " + e.message);
   }
+  if (captureOperation !== operation) return;
+  captureOperation = null;
   busy(false);
   poll();
 }
 
 async function stop() {
+  const operation = {};
+  captureOperation = operation;
   busy(true);
   log("停止中…（拉回檔案、分析）");
   try {
     const r = await api("/api/stop", {});
+    if (captureOperation !== operation) return;
     log("完成: " + r.output);
     await loadCaptures();
     if (r.id) openCapture(r.id);
   } catch (e) {
-    log("停止失敗: " + e.message);
+    if (captureOperation === operation) log("停止失敗: " + e.message + "；可按「強制關閉」解除狀態。");
   }
+  if (captureOperation !== operation) return;
+  captureOperation = null;
   busy(false);
   poll();
+}
+
+async function forceStop() {
+  if (forceClosing || !confirm("強制關閉目前擷取？\n會中止卡住的操作並保留本機已取得的檔案；未拉回的資料可能不完整。")) return;
+  forceClosing = true;
+  captureOperation = null;
+  busy(true);
+  $("btn-force-stop").disabled = true;
+  log("強制關閉中…");
+  try {
+    const result = await api("/api/force-stop", {});
+    captureOperation = null;
+    busy(false);
+    log(result.output);
+    await loadCaptures();
+  } catch (error) {
+    log("強制關閉失敗: " + error.message);
+  } finally {
+    forceClosing = false;
+    busy(false);
+    await poll();
+  }
 }
 
 async function mark() {
@@ -531,11 +571,12 @@ function renderResult(id, s) {
   html += `<h3>BR/EDR 配對流程</h3>${eventTable(brEvents, rel)}<h3>LE 配對流程</h3>${eventTable(leEvents, rel)}`;
 
   html += "<h3>CCCD 寫入</h3>" + eventTable(s.events.filter((e) => e.category === "cccd"), rel);
+  html += "<h3>GATT 寫入（Control Point 等）</h3>" + eventTable(s.events.filter((e) => e.category === "gatt_write"), rel);
   html += "<h3>ATT 回覆（Error Response）</h3><p class='hint'>協定的 Error Response 不一定代表故障：查無屬性／探索結束與不支援的群組查詢分別標示，其他異常保留為錯誤。</p>" + eventTable(s.events.filter(isAttErrorResponse), rel);
   html += "<h3>金鑰快照差異（開始 → 結束）</h3>" + keyTable(s.keys);
   html += `<h3>全部事件</h3><div class="filters">${Object.entries(CATEGORY).map(([k, v]) =>
-    `<label><input type="checkbox" data-cat="${k}" checked><span style="color:${v.color}">${v.label}</span></label>`).join("")}</div>
-    <div id="all-events">${eventTable(s.events, rel)}</div>`;
+    `<label><input type="checkbox" data-cat="${k}"${DEFAULT_OFF.has(k) ? "" : " checked"}><span style="color:${v.color}">${v.label}</span></label>`).join("")}</div>
+    <div id="all-events">${eventTable(s.events.filter((e) => !DEFAULT_OFF.has(e.category)), rel)}</div>`;
 
   $("result").innerHTML = html;
   $("btn-download-log").onclick = () => openDownload(id);
@@ -718,7 +759,7 @@ function drawTimeline() {
     } else {
       parts.push(`<text x="6" y="${y + 21}" class="rowlabel">其他（無連線）</text>`);
     }
-    const evs = s.events.filter((e) => e.category !== "mark" && (c ? e.conn === c.id : e.conn == null) && e.t >= v0 - span * 0.02 && e.t <= v1 + span * 0.02);
+    const evs = s.events.filter((e) => e.category !== "mark" && !DEFAULT_OFF.has(e.category) && (c ? e.conn === c.id : e.conn == null) && e.t >= v0 - span * 0.02 && e.t <= v1 + span * 0.02);
     // 當放大到一定程度時，錯開重疊的事件點高度讓細節更容易點選
     let lastPx = -999, stagger = 0;
     for (const e of evs) {
@@ -1368,6 +1409,7 @@ $("scenario").innerHTML = SCENARIOS.map((s) => `<option>${esc(s)}</option>`).joi
 $("phone").value = localStorage.getItem("phone") || "";
 $("btn-start").onclick = start;
 $("btn-stop").onclick = stop;
+$("btn-force-stop").onclick = forceStop;
 $("btn-mark").onclick = mark;
 $("mark-text").onkeydown = (e) => { if (e.key === "Enter") mark(); };
 window.reanalyze = reanalyze;

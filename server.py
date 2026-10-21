@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,11 @@ CONTROL_PATH = "/tmp/btcap-ssh-%r@%h:%p"
 REQUIRED_TOOLS = ("btmon", "dbus-monitor", "bluetoothctl")
 
 lock = threading.Lock()
+capture_lock = threading.Lock()
+capture_process_lock = threading.Lock()
+capture_process = None
+force_stop_lock = threading.Lock()
+force_stop_requested = threading.Event()
 
 
 # ---------- 儀表連線設定 ----------
@@ -159,12 +165,63 @@ def install_pubkey(host, password):
 
 
 def run_capture(*args, timeout=120):
-    env = dict(os.environ, BTCAP_HOST=get_host())
-    p = subprocess.run(["bash", CAPTURE_SH, *args], capture_output=True, text=True, timeout=timeout, env=env)
-    out = (p.stdout + p.stderr).strip()
+    global capture_process
+    env = dict(os.environ, BTCAP_HOST=get_host(), BTCAP_DIR=CAP_ROOT)
+    tracked = args[0] in ("start", "stop")
+    with capture_process_lock:
+        if tracked and force_stop_requested.is_set():
+            raise RuntimeError("正在強制關閉擷取，請稍後再開始")
+        p = subprocess.Popen(["bash", CAPTURE_SH, *args], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
+        p.force_cancelled = False
+        if tracked:
+            capture_process = p
+    try:
+        try:
+            stdout, stderr = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.communicate()
+            raise RuntimeError("擷取操作逾時；請重試或使用強制關閉解除狀態")
+    finally:
+        with capture_process_lock:
+            if capture_process is p:
+                capture_process = None
+    if p.force_cancelled:
+        raise RuntimeError("擷取操作已被強制關閉")
+    out = (stdout + stderr).strip()
     if p.returncode != 0:
         raise RuntimeError(out or "capture.sh 失敗")
     return out
+
+
+def force_stop_capture():
+    with force_stop_lock:
+        # 必須先取消正在持有 capture_lock 的停止／啟動程序，再等待鎖。
+        with capture_process_lock:
+            force_stop_requested.set()
+            process = capture_process
+            if process is not None:
+                process.force_cancelled = True
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        try:
+            with capture_lock:
+                try:
+                    output = run_capture("force-stop", timeout=15)
+                except RuntimeError as error:
+                    # force-stop 在 SSH 清理前已解除 .current；遠端逾時仍視為本機關閉成功。
+                    if current_capture() is not None:
+                        raise
+                    output = "本機擷取狀態已解除；儀表端清理未完成：" + str(error)
+                return output
+        finally:
+            force_stop_requested.clear()
 
 
 def current_capture():
@@ -439,19 +496,22 @@ class Handler(BaseHTTPRequestHandler):
                 install_pubkey(host, body.get("password", ""))
                 return self.send_json({"ok": True, "test": test_connection(host)})
             if path == "/api/start":
-                with lock:
+                with capture_lock:
                     out = run_capture("start", body.get("scenario") or "未指定",
                                       body.get("app", ""), body.get("phone", ""))
                 return self.send_json({"ok": True, "output": out})
             if path == "/api/mark":
-                out = run_capture("mark", body.get("text", ""), timeout=15)
+                with capture_lock:
+                    out = run_capture("mark", body.get("text", ""), timeout=15)
                 return self.send_json({"ok": True, "output": out})
             if path == "/api/stop":
-                with lock:
+                with capture_lock:
                     out = run_capture("stop", timeout=300)
                 ids = [os.path.basename(l.strip()) for l in out.splitlines()
                        if l.strip().startswith(CAP_ROOT + os.sep)]
                 return self.send_json({"ok": True, "output": out, "id": ids[-1] if ids else ""})
+            if path == "/api/force-stop":
+                return self.send_json({"ok": True, "output": force_stop_capture()})
             m = re.match(r"^/api/captures/([^/]+)/delete$", path)
             if m:
                 delete_capture(m.group(1))

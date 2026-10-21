@@ -75,6 +75,14 @@ ATT_OPCODES = {
 
 PSM_ATT = 0x001F
 
+# 儀表 BLE-CAN 自訂特徵值（khi-6230 App/bluetooth/bluetooth_gatt_service.h）
+KNOWN_UUIDS = {
+    "797143a2-a920-41d0-8af5-4ea9ab4bbc08": "Control Point",
+    "1e8c070c-9443-4b66-b002-0cc5252b2f0f": "Data Source",
+    "7e32e5fd-7394-48ea-9147-ca1aea6fe567": "Data Source Mid",
+    "802042c2-cf8b-4e2e-a7e6-ccfea32cf045": "Data Source High",
+}
+
 
 def bdaddr(b):
     return ":".join("%02X" % x for x in reversed(b[:6]))
@@ -82,6 +90,18 @@ def bdaddr(b):
 
 def hex_reason(code, table):
     return "0x%02X %s" % (code, table.get(code, "Unknown"))
+
+
+def uuid_str(b):
+    if len(b) == 2:
+        return "0x%04X" % struct.unpack("<H", b)[0]
+    h = bytes(reversed(b)).hex()
+    return "%s-%s-%s-%s-%s" % (h[:8], h[8:12], h[12:16], h[16:20], h[20:])
+
+
+def hex_data(b, limit=20):
+    text = " ".join("%02X" % x for x in b[:limit])
+    return text + (" …（共 %d bytes）" % len(b) if len(b) > limit else "")
 
 
 def classify_att_error(req_op, err):
@@ -101,6 +121,8 @@ class Analyzer:
         self.att_errors = []
         self.warnings = []
         self.cccd_handles = set()
+        self.char_uuids = {}         # (連線 id, 伺服器是否為本機, value handle) → UUID
+        self.pending_read_type = {}  # (連線 id, 請求方向 tx) → Read By Type 查詢的屬性類型
         self.pending_l2cap = {}
         self.pending_disconnect = {}
         self.first_ts = None
@@ -111,6 +133,11 @@ class Analyzer:
     def event(self, t, conn, category, title, detail=""):
         self.events.append({"t": t, "conn": conn["id"] if conn else None,
                             "category": category, "title": title, "detail": detail})
+
+    def char_label(self, c, server_local, h):
+        uuid = self.char_uuids.get((c["id"], server_local, h))
+        label = "handle 0x%04X" % h
+        return "%s %s" % (label, KNOWN_UUIDS.get(uuid, uuid)) if uuid else label
 
     def conn_by_addr(self, addr, transport=None):
         for c in reversed(self.connections):
@@ -395,6 +422,10 @@ class Analyzer:
             c["notify_buckets"][sec] = c["notify_buckets"].get(sec, 0) + 1
         elif op == 0x1D:
             c["indications"] += 1
+        if op in (0x1B, 0x1D) and len(p) >= 3:
+            h = struct.unpack("<H", p[1:3])[0]
+            self.event(t, c, "notify", ATT_OPCODES[op],
+                       "%s %s = %s" % (direction, self.char_label(c, tx, h), hex_data(p[3:])))
         elif op in (0x12, 0x52) and len(p) >= 3:
             c["writes"] += 1
             h = struct.unpack("<H", p[1:3])[0]
@@ -405,6 +436,19 @@ class Analyzer:
                 tag = "" if h in self.cccd_handles else "（推測）"
                 self.event(t, c, "cccd", "CCCD 寫入" + tag,
                            "%s handle 0x%04X = %s" % (direction, h, meaning))
+            else:
+                self.event(t, c, "gatt_write", "GATT 寫入" if op == 0x12 else "GATT 寫入（Write Cmd）",
+                           "%s %s = %s" % (direction, self.char_label(c, not tx, h), hex_data(val)))
+        elif op == 0x08 and len(p) >= 7:
+            attr_type = p[5:]
+            self.pending_read_type[(c["id"], tx)] = struct.unpack("<H", attr_type)[0] if len(attr_type) == 2 else None
+        elif op == 0x09 and len(p) >= 2:
+            # 特徵值宣告（0x2803）：handle(2) + properties(1) + value handle(2) + UUID(2/16)
+            if self.pending_read_type.pop((c["id"], not tx), None) == 0x2803 and p[1] >= 7:
+                step = p[1]
+                for i in range(2, len(p) - step + 1, step):
+                    vh = struct.unpack("<H", p[i + 3:i + 5])[0]
+                    self.char_uuids[(c["id"], tx, vh)] = uuid_str(p[i + 5:i + step])
         elif op == 0x05 and len(p) >= 2:
             fmt = p[1]
             step = 4 if fmt == 1 else 18
@@ -608,6 +652,8 @@ def analyze(dirpath):
     meta_path = os.path.join(dirpath, "meta.json")
     meta = json.load(open(meta_path, encoding="utf-8")) if os.path.exists(meta_path) else {}
     an = Analyzer()
+    if meta.get("capture_error"):
+        an.warnings.append(meta["capture_error"])
     snoop = os.path.join(dirpath, "hci.btsnoop")
     if os.path.exists(snoop):
         try:

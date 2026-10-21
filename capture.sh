@@ -3,6 +3,7 @@
 #   capture.sh start <scenario> <app> <phone>
 #   capture.sh mark "<text>"
 #   capture.sh stop
+#   capture.sh force-stop
 #   capture.sh status
 set -euo pipefail
 
@@ -14,6 +15,7 @@ REMOTE_DIR=/tmp/btcap
 MIN_FREE_KB=20480
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new
+          -o ServerAliveInterval=3 -o ServerAliveCountMax=2
           -o ControlMaster=auto -o "ControlPath=/tmp/btcap-ssh-%r@%h:%p" -o ControlPersist=300)
 
 die() { echo "錯誤: $*" >&2; exit 1; }
@@ -135,24 +137,83 @@ cmd_stop() {
     [ -f "$CURRENT" ] || die "目前沒有擷取進行中"
     local dir
     dir=$(cat "$CURRENT")
+    [ -d "$dir" ] || die "本機擷取目錄不存在，請使用強制關閉解除狀態"
+
+    local status
+    if rsh "test -d '$REMOTE_DIR'"; then
+        :
+    else
+        status=$?
+        if [ "$status" -eq 1 ]; then
+            local message="儀表端 $REMOTE_DIR 已不存在（可能重開機或暫存目錄被清除）；本次資料不完整，已保留本機檔案。"
+            echo "警告: $message" >&2
+            finish_capture "$dir" missing_remote "$message"
+            python3 "$HERE/analyze.py" "$dir" || true
+            echo "$dir"
+            return
+        fi
+        die "無法確認儀表端擷取狀態（SSH 失敗）；可重試停止或使用強制關閉"
+    fi
 
     rsh "[ -f $REMOTE_DIR/pids ] && kill \$(cat $REMOTE_DIR/pids) 2>/dev/null; sleep 1; rm -f $REMOTE_DIR/pids" || true
     kill_strays || true
     snapshot "$dir" after
-    rsh "tar cf - -C $REMOTE_DIR ." | tar xf - -C "$dir" || die "拉回檔案失敗，儀表端資料仍保留在 $REMOTE_DIR"
+    # 完整拉回後才合併，避免傳輸失敗覆寫先前已取得的檔案。
+    local staging
+    staging=$(mktemp -d "$dir/.pull.XXXXXX")
+    if rsh "tar cf - -C '$REMOTE_DIR' ." | tar xf - -C "$staging"; then
+        cp -a "$staging/." "$dir/"
+        rm -rf "$staging"
+    else
+        rm -rf "$staging"
+        die "拉回檔案失敗；本機已取得的檔案仍保留。請確認儀表端 $REMOTE_DIR，或使用強制關閉解除狀態"
+    fi
     rsh "rm -rf $REMOTE_DIR" || true
 
-    python3 - "$dir/meta.json" "$(now)" <<'EOF'
-import json, sys
-p = sys.argv[1]
-m = json.load(open(p, encoding="utf-8"))
-m["stop_time"] = float(sys.argv[2])
-json.dump(m, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-EOF
-    rm -f "$CURRENT"
+    finish_capture "$dir" complete ""
 
     python3 "$HERE/analyze.py" "$dir" || echo "警告: 分析失敗，原始檔案已保存在 $dir" >&2
     echo "$dir"
+}
+
+finish_capture() {
+    local dir="$1" status="$2" message="$3"
+    if [ -d "$dir" ]; then
+        python3 - "$dir/meta.json" "$(now)" "$status" "$message" <<'EOF'
+import json, os, sys
+p, stop, status, message = sys.argv[1:]
+try:
+    with open(p, encoding="utf-8") as f:
+        meta = json.load(f)
+except (OSError, ValueError):
+    meta = {}
+meta.update(stop_time=float(stop), completion_status=status)
+if message:
+    meta["capture_error"] = message
+else:
+    meta.pop("capture_error", None)
+with open(p + ".tmp", "w", encoding="utf-8") as f:
+    json.dump(meta, f, ensure_ascii=False, indent=2)
+os.replace(p + ".tmp", p)
+EOF
+    fi
+    rm -f "$CURRENT"
+}
+
+cmd_force_stop() {
+    local dir="" message="使用者強制關閉擷取；未完成拉回的資料可能仍留在儀表端 $REMOTE_DIR，本機檔案已保留。"
+    [ ! -f "$CURRENT" ] || dir=$(cat "$CURRENT")
+    # 先解除本機狀態，遠端失聯也不能再卡住下一輪擷取。
+    finish_capture "$dir" forced "$message"
+    echo "已強制關閉本機擷取狀態；已取得的紀錄均保留。"
+    [ -z "$dir" ] || echo "$dir"
+    # 不刪遠端資料。只盡力停止本工具的收集程序及清掉 pid 標記。
+    if rsh "pkill -f '[b]tmon -w $REMOTE_DIR/'; pkill -f \"[d]bus-monitor --system sender='org.bluez'\";
+             pkill -f '[j]ournalctl -f -n 0 -o short-precise'; rm -f '$REMOTE_DIR/pids'; true"; then
+        echo "儀表端擷取程序已清理，暫存檔案未刪除。"
+    else
+        echo "警告: 無法清理儀表端擷取程序；本機狀態已解除，可重新開始。" >&2
+    fi
 }
 
 cmd_status() {
@@ -164,6 +225,7 @@ case "${1:-}" in
     start)  shift; cmd_start "$@" ;;
     mark)   shift; cmd_mark "$@" ;;
     stop)   shift; cmd_stop ;;
+    force-stop) shift; cmd_force_stop ;;
     status) cmd_status ;;
-    *) die "用法: capture.sh {start <scenario> [app] [phone] | mark <text> | stop | status}" ;;
+    *) die "用法: capture.sh {start <scenario> [app] [phone] | mark <text> | stop | force-stop | status}" ;;
 esac

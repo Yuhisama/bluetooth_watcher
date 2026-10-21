@@ -6,7 +6,7 @@ const vm = require("node:vm");
 const elements = new Map();
 function node() {
   return {
-    value: "", innerHTML: "", textContent: "", disabled: false,
+    value: "", innerHTML: "", textContent: "", disabled: false, dataset: {},
     querySelectorAll: () => [],
     querySelector() { return this.child || null; },
     replaceChildren(child) { this.child = child; },
@@ -16,7 +16,7 @@ function node() {
     showModal() { this.open = true; },
     click() { this.clicked = true; },
     remove() {},
-    classList: {add() {}, remove() {}},
+    classList: {add() {}, remove() {}, toggle() {}},
   };
 }
 function element(id) {
@@ -167,4 +167,25 @@ vm.runInContext("loadCaptures()", context).then(() => {
   assert.equal(element("download-error").textContent, "檔案不存在");
   assert.equal(element("download-submit").disabled, false);
   console.log("PASS: ZIP file selection/name validation, browser download, chosen destination write, error recovery");
+}).then(async () => {
+  let completeOldStop;
+  context.oldStop = new Promise((resolve) => { completeOldStop = resolve; });
+  context.confirm = () => true;
+  vm.runInContext(`
+    api = async (path) => path === "/api/stop" ? oldStop : {ok: true, output: "已強制關閉"};
+    loadCaptures = async () => {};
+    poll = async () => applyState({state: "idle", current: null});
+  `, context);
+  const pending = vm.runInContext("stop()", context);
+  vm.runInContext('applyState({state: "capturing", current: {meta: {}, elapsed: 1}})', context);
+  assert.equal(element("btn-stop").disabled, true);
+  assert.equal(element("btn-force-stop").disabled, false);
+  await vm.runInContext("forceStop()", context);
+  assert.equal(element("btn-start").disabled, false);
+  assert.equal(element("btn-stop").disabled, true);
+  completeOldStop({output: "舊停止回覆", id: "old"});
+  await pending;
+  assert.ok(!element("log").textContent.includes("完成: 舊停止回覆"));
+  assert.ok(element("log").textContent.includes("已強制關閉"));
+  console.log("PASS: force close stays available during stop, restores idle controls, ignores stale response");
 }).catch((error) => { console.error(error); process.exitCode = 1; });

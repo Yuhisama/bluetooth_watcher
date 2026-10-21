@@ -16,6 +16,7 @@ button { padding: 7px 14px; border: 1px solid #bbc; border-radius: 5px; backgrou
 button:disabled { opacity: .45; cursor: default; }
 button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 button.danger { background: #d73a49; border-color: #d73a49; color: #fff; }
+button.force-stop { color: #b45309; border-color: #e7b777; background: #fff8ed; }
 button.busy { pointer-events: none; opacity: .6; }
 .buttons { display: flex; gap: 8px; margin: 10px 0; }
 .buttons button { flex: 1; }
