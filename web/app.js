@@ -33,12 +33,24 @@ const hex4 = (n) => "0x" + n.toString(16).toUpperCase().padStart(4, "0");
 
 let state = "idle";
 let currentId = null;
+let captureList = [];
+let folders = [];
+let selectedFolder = "*";
+const CAPTURE_DRAG_TYPE = "application/x-bt-capture";
+let downloadCaptureId = null;
+let downloadFiles = [];
+let archiveSaveFile = null;
+let archiveBusy = false;
 
 async function api(path, body) {
   const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   const r = await fetch(path, opt);
   const j = await r.json();
-  if (!r.ok || j.ok === false) throw new Error(j.error || r.statusText);
+  if (!r.ok || j.ok === false) {
+    const error = new Error(j.error || r.statusText);
+    error.status = r.status;
+    throw error;
+  }
   return j;
 }
 
@@ -138,22 +150,153 @@ async function mark() {
 
 // ---------- 紀錄清單 ----------
 async function loadCaptures() {
-  const list = await api("/api/captures");
-  const phones = new Set();
-  $("captures").innerHTML = list.map((c) => {
-    if (c.meta.phone) phones.add(c.meta.phone);
-    const t = c.meta.start_time ? new Date(c.meta.start_time * 1000).toLocaleString("zh-TW", { hour12: false }) : c.id;
-    const title = c.incomplete ? "（不完整：擷取啟動失敗）" : c.meta.scenario;
-    const sub = c.incomplete ? esc(c.id) : `${esc(t)}｜${esc(c.meta.app)}｜${esc(c.meta.phone)}${c.analyzed ? "" : "｜未分析"}`;
-    return `<li data-id="${esc(c.id)}" class="${c.id === currentId ? "active" : ""}${c.incomplete ? " incomplete" : ""}">
-      <button class="cap-del" title="刪除這筆紀錄" data-del="${esc(c.id)}">✕</button>
-      <div class="cap-title">${esc(title)}</div>
-      <div class="cap-sub">${sub}</div></li>`;
-  }).join("") || "<li class='empty'>尚無紀錄</li>";
+  const folderRequest = api("/api/folders").catch((e) => {
+    if (e.status !== 404) throw e;
+    log("伺服器尚未更新，請重啟 server.py 以啟用改名與資料夾分類；現有紀錄仍可檢視。");
+    return [];
+  });
+  [captureList, folders] = await Promise.all([api("/api/captures"), folderRequest]);
+  if (selectedFolder !== "*" && selectedFolder !== "" && !folders.some((f) => f.id === selectedFolder)) selectedFolder = "*";
+  renderCaptures();
+  const phones = new Set(captureList.map((c) => c.meta.phone).filter(Boolean));
   $("phones").innerHTML = [...phones].map((p) => `<option value="${esc(p)}">`).join("");
-  for (const li of $("captures").querySelectorAll("li[data-id]")) li.onclick = () => openCapture(li.dataset.id);
+}
+
+function renderFolders() {
+  const entries = [{id: "*", name: "全部紀錄"}, {id: "", name: "未分類"}, ...folders];
+  $("folders").innerHTML = entries.map((f) => {
+    const count = captureList.filter((c) => f.id === "*" || (c.folder || "") === f.id).length;
+    return `<button class="folder-item${f.id === selectedFolder ? " selected" : ""}" data-folder="${esc(f.id)}" aria-pressed="${f.id === selectedFolder}" title="${f.id === "*" ? "檢視全部紀錄" : "點擊檢視，或拖曳紀錄到這裡"}"><span>${f.id === "*" ? "☰" : "📁"} ${esc(f.name)}</span><small>${count}</small></button>`;
+  }).join("");
+  for (const button of $("folders").querySelectorAll("[data-folder]")) {
+    const folder = button.dataset.folder;
+    button.onclick = () => { selectedFolder = folder; renderCaptures(); };
+    if (folder === "*") continue;
+    button.ondragover = (e) => {
+      if (!Array.from(e.dataTransfer.types).includes(CAPTURE_DRAG_TYPE)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      button.classList.add("drop-target");
+    };
+    button.ondragleave = (e) => {
+      if (!button.contains(e.relatedTarget)) button.classList.remove("drop-target");
+    };
+    button.ondrop = async (e) => {
+      e.preventDefault();
+      button.classList.remove("drop-target");
+      const id = e.dataTransfer.getData(CAPTURE_DRAG_TYPE);
+      if (!captureList.some((c) => c.id === id)) return;
+      try {
+        await saveOrganization(id, {folder});
+        log(`已移到「${entries.find((f) => f.id === folder).name}」`);
+      } catch (error) {
+        alert("移動失敗: " + error.message);
+      }
+    };
+  }
+}
+
+function renderCaptures() {
+  const selected = selectedFolder;
+  renderFolders();
+  const specificFolder = folders.some((f) => f.id === selected);
+  $("folder-rename").disabled = $("folder-delete").disabled = !specificFolder;
+  const list = captureList.filter((c) => selected === "*" || (c.folder || "") === selected);
+  $("captures").innerHTML = list.map((c) => {
+    const t = c.meta.start_time ? new Date(c.meta.start_time * 1000).toLocaleString("zh-TW", { hour12: false }) : c.id;
+    const title = c.name || (c.incomplete ? "（不完整：擷取啟動失敗）" : c.meta.scenario);
+    const folderName = folders.find((f) => f.id === c.folder)?.name || "未分類";
+    const sub = c.incomplete ? esc(c.id) : `${esc(t)}｜${esc(c.meta.app)}｜${esc(c.meta.phone)}${c.analyzed ? "" : "｜未分析"}`;
+    return `<li data-id="${esc(c.id)}" draggable="true" class="${c.id === currentId ? "active" : ""}${c.incomplete ? " incomplete" : ""}">
+      <button class="cap-del" title="刪除這筆紀錄" data-del="${esc(c.id)}">✕</button>
+      <div class="cap-title" tabindex="0" title="雙擊改名，或按 F2">${esc(title)}</div>
+      <div class="cap-sub">${sub}<br>📁 ${esc(folderName)}${c.incomplete ? "｜不完整" : ""}</div></li>`;
+  }).join("") || "<li class='empty'>此分類尚無紀錄</li>";
+  for (const li of $("captures").querySelectorAll("li[data-id]")) {
+    li.onclick = () => openCapture(li.dataset.id);
+    const title = li.querySelector(".cap-title");
+    title.ondblclick = (e) => { e.stopPropagation(); renameCapture(li.dataset.id, title); };
+    title.onkeydown = (e) => {
+      if (e.key === "F2") { e.preventDefault(); renameCapture(li.dataset.id, title); }
+    };
+    li.ondragstart = (e) => {
+      if (li.querySelector("input")) { e.preventDefault(); return; }
+      e.dataTransfer.setData(CAPTURE_DRAG_TYPE, li.dataset.id);
+      e.dataTransfer.effectAllowed = "move";
+      li.classList.add("dragging");
+    };
+    li.ondragend = () => {
+      li.classList.remove("dragging");
+      for (const target of $("folders").querySelectorAll(".drop-target")) target.classList.remove("drop-target");
+    };
+  }
   for (const b of $("captures").querySelectorAll("button[data-del]")) {
     b.onclick = (e) => { e.stopPropagation(); deleteCapture(b.dataset.del); };
+  }
+}
+
+function renameCapture(id, title) {
+  const c = captureList.find((c) => c.id === id);
+  if (!c || title.querySelector("input")) return;
+  const original = title.textContent;
+  const input = document.createElement("input");
+  input.className = "cap-name-input";
+  input.maxLength = 120;
+  input.value = c.name || c.meta.scenario || "";
+  input.setAttribute("aria-label", "紀錄名稱");
+  input.title = "Enter 儲存，Esc 取消；留空恢復原名";
+  title.replaceChildren(input);
+  let finished = false;
+  const finish = async (cancel = false) => {
+    if (finished) return;
+    finished = true;
+    const name = input.value.trim();
+    title.textContent = original;
+    if (cancel || name === (c.name || c.meta.scenario || "")) return;
+    try {
+      await saveOrganization(id, {name});
+    } catch (e) {
+      alert("改名失敗: " + e.message);
+    }
+  };
+  input.onclick = input.ondblclick = (e) => e.stopPropagation();
+  input.onkeydown = (e) => {
+    e.stopPropagation();
+    if (e.isComposing) return;
+    if (e.key === "Enter" || e.key === "Escape") {
+      e.preventDefault();
+      finish(e.key === "Escape");
+    }
+  };
+  input.onblur = () => finish();
+  input.focus();
+  input.select();
+}
+
+async function saveOrganization(id, changes) {
+  await api(`/api/captures/${encodeURIComponent(id)}/organization`, changes);
+  await loadCaptures();
+  if (currentId === id) await openCapture(id);
+}
+
+async function manageFolder(action) {
+  const folder = folders.find((f) => f.id === selectedFolder);
+  const body = { id: folder?.id };
+  if (action === "delete") {
+    if (!folder || !confirm(`刪除分類資料夾「${folder.name}」？裡面的紀錄會移回「未分類」，擷取檔案會保留。`)) return;
+  } else {
+    const name = prompt(action === "create" ? "新增分類資料夾名稱：" : "修改分類資料夾名稱：", action === "rename" ? folder?.name : "");
+    if (name === null) return;
+    body.name = name;
+  }
+  try {
+    await api(`/api/folders/${action}`, body);
+    await loadCaptures();
+    // 新增後保持目前清單，方便直接將現有紀錄拖進新資料夾。
+    renderCaptures();
+    if (currentId) await openCapture(currentId);
+  } catch (e) {
+    alert("資料夾操作失敗: " + e.message);
   }
 }
 
@@ -210,19 +353,159 @@ function flash(msg, cls) {
   $("result").prepend(el);
 }
 
+// ---------- LOG 壓縮下載 ----------
+const LOG_DESCRIPTIONS = {
+  "hci.btsnoop": "原始藍牙封包，可用 Wireshark 開啟",
+  "btmon.out": "藍牙封包文字解析",
+  "summary.txt": "連線、配對與 ATT 分析摘要",
+  "dbus.log": "D-Bus 事件紀錄",
+  "journal.log": "系統服務日誌",
+  "marks.txt": "擷取時的操作標記",
+  "bluetoothctl_before.txt": "擷取前的藍牙裝置狀態",
+  "bluetoothctl_after.txt": "擷取後的藍牙裝置狀態",
+  "keys_before.tgz": "擷取前的金鑰快照",
+  "keys_after.tgz": "擷取後的金鑰快照",
+};
+
+function formatBytes(size) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function zipFilename(value) {
+  const name = value.trim().replace(/\.zip$/i, "");
+  if (!name || name.length > 120 || /[\\/:*?"<>|\x00-\x1f]/.test(name) || /[. ]$/.test(name)) {
+    throw new Error("請輸入有效的壓縮檔名稱，不可包含 \\ / : * ? \" < > |");
+  }
+  return name + ".zip";
+}
+
+function selectedLogFiles() {
+  return [...$("download-files").querySelectorAll("input:checked")].map((cb) => cb.value);
+}
+
+function updateDownloadSelection() {
+  const selected = new Set(selectedLogFiles());
+  const bytes = downloadFiles.filter((f) => selected.has(f.name)).reduce((sum, f) => sum + f.size, 0);
+  $("download-selection").textContent = `已選 ${selected.size} / ${downloadFiles.length} 個檔案 · 原始大小 ${formatBytes(bytes)}`;
+  $("download-submit").disabled = archiveBusy || selected.size === 0;
+}
+
+async function openDownload(id) {
+  downloadCaptureId = id;
+  downloadFiles = [];
+  archiveSaveFile = null;
+  const c = captureList.find((c) => c.id === id);
+  $("download-capture").textContent = c?.name || c?.meta.scenario || id;
+  $("download-name").value = (c?.name || id).replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").replace(/[. ]+$/, "").slice(0, 116);
+  $("download-files").textContent = "載入檔案中…";
+  $("download-selection").textContent = "";
+  $("download-error").textContent = $("download-status").textContent = "";
+  $("download-submit").disabled = true;
+  $("download-destination").value = "瀏覽器預設下載位置";
+  $("download-choose").disabled = !window.showSaveFilePicker;
+  $("download-destination-hint").textContent = window.showSaveFilePicker
+    ? "開啟系統的另存新檔視窗，可選擇 Windows 桌面或其他位置。"
+    : "此瀏覽器不支援指定儲存位置；請在瀏覽器下載設定啟用「每次下載前詢問儲存位置」。";
+  $("download-dialog").showModal();
+  try {
+    downloadFiles = await api(`/api/captures/${encodeURIComponent(id)}/files`);
+    $("download-files").innerHTML = downloadFiles.map((f) => `<label class="download-file"><input type="checkbox" value="${esc(f.name)}" ${f.name.startsWith("keys_") ? "" : "checked"}><span><strong>${esc(f.name)}</strong><small>${esc(LOG_DESCRIPTIONS[f.name] || "擷取紀錄")}</small></span><span class="file-size">${formatBytes(f.size)}</span></label>`).join("") || "沒有可下載的檔案";
+    updateDownloadSelection();
+  } catch (e) {
+    $("download-files").textContent = "無法載入檔案清單";
+    $("download-error").textContent = e.status === 404 ? "伺服器尚未更新，請重啟 server.py 後重試。" : e.message;
+  }
+}
+
+async function chooseDownloadDestination() {
+  try {
+    const file = await window.showSaveFilePicker({
+      suggestedName: zipFilename($("download-name").value),
+      types: [{description: "ZIP 壓縮檔", accept: {"application/zip": [".zip"]}}],
+      excludeAcceptAllOption: true,
+    });
+    archiveSaveFile = file;
+    $("download-name").value = file.name.replace(/\.zip$/i, "");
+    $("download-destination").value = `已指定儲存位置：${file.name}`;
+    $("download-error").textContent = "";
+  } catch (e) {
+    if (e.name !== "AbortError") $("download-error").textContent = "無法選擇目的地：" + e.message;
+  }
+}
+
+async function downloadArchive(e) {
+  e.preventDefault();
+  if (archiveBusy) return;
+  let filename;
+  const files = selectedLogFiles();
+  $("download-error").textContent = "";
+  try {
+    filename = zipFilename($("download-name").value);
+    if (!files.length) throw new Error("請至少選擇一個檔案");
+  } catch (error) {
+    $("download-error").textContent = error.message;
+    return;
+  }
+  archiveBusy = true;
+  for (const control of $("download-form").querySelectorAll("input, button")) control.disabled = true;
+  $("download-status").textContent = "正在壓縮…";
+  let writable = null;
+  try {
+    const response = await fetch(`/api/captures/${encodeURIComponent(downloadCaptureId)}/archive`, {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name: filename, files}),
+    });
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || "壓縮失敗");
+    }
+    const blob = await response.blob();
+    if (archiveSaveFile) {
+      writable = await archiveSaveFile.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      writable = null;
+      $("download-status").textContent = "已儲存到指定位置。";
+    } else {
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      $("download-status").textContent = "已交給瀏覽器下載。";
+    }
+    log("已匯出 LOG：" + filename + `（${files.length} 個檔案）`);
+  } catch (error) {
+    if (writable) await writable.abort().catch(() => {});
+    $("download-status").textContent = "";
+    $("download-error").textContent = error.message;
+  } finally {
+    archiveBusy = false;
+    for (const control of $("download-form").querySelectorAll("input, button")) control.disabled = false;
+    $("download-choose").disabled = !window.showSaveFilePicker;
+    updateDownloadSelection();
+  }
+}
+
 // ---------- 結果 ----------
 function renderResult(id, s) {
   s.events.forEach((e, i) => (e._idx = i));
   const base = s.capture.first_ts;
   const rel = (t) => (base == null ? "" : "+" + (t - base).toFixed(3) + "s");
   const m = s.meta;
+  const organization = s.organization || {};
+  const folderName = folders.find((f) => f.id === organization.folder)?.name || "未分類";
   const off = m.clock_offset != null ? `儀表時鐘與電腦相差 ${fmtOffset(m.clock_offset)}` : "";
-  const files = ["hci.btsnoop", "btmon.out", "summary.txt", "dbus.log", "journal.log", "bluetoothctl_before.txt", "bluetoothctl_after.txt"];
 
   let html = `<div class="result-head">
-    <h2>${esc(m.scenario)}｜${esc(m.app)}｜${esc(m.phone)}</h2>
+    <h2 class="cap-title" tabindex="0" title="雙擊改名，或按 F2">${organization.name ? esc(organization.name) : `${esc(m.scenario)}｜${esc(m.app)}｜${esc(m.phone)}`}</h2>
+    <div class="sub">📁 ${esc(folderName)}${organization.name ? `｜${esc(m.scenario)}｜${esc(m.app)}｜${esc(m.phone)}` : ""}</div>
     <div class="sub">${esc(id)}｜封包 ${s.capture.packets}｜${esc(off)}（時間軸使用儀表時鐘）</div>
-    <div class="downloads">${files.map((f) => `<a href="/api/captures/${encodeURIComponent(id)}/${f}">${f}</a>`).join("")}
+    <div class="downloads"><button id="btn-download-log" class="download-log-button">↓ 下載 LOG</button>
       <button class="primary" onclick="toggleSimulator()">▶ 模擬動作</button>
       <button onclick="reanalyze('${esc(id)}')" title="用目前版本的 analyze.py 重新解析原始檔">重新分析</button>
       <button class="danger" onclick="deleteCapture('${esc(id)}')">刪除紀錄</button></div></div>
@@ -255,6 +538,12 @@ function renderResult(id, s) {
     <div id="all-events">${eventTable(s.events, rel)}</div>`;
 
   $("result").innerHTML = html;
+  $("btn-download-log").onclick = () => openDownload(id);
+  const resultTitle = $("result").querySelector(".result-head h2");
+  resultTitle.ondblclick = () => renameCapture(id, resultTitle);
+  resultTitle.onkeydown = (e) => {
+    if (e.key === "F2") { e.preventDefault(); renameCapture(id, resultTitle); }
+  };
   initTimeline(s);
   const updateAllEvents = () => {
     const on = new Set([...document.querySelectorAll(".filters input:checked")].map((x) => x.dataset.cat));
@@ -1056,6 +1345,25 @@ async function initConn() {
 }
 
 // ---------- init ----------
+$("download-form").onsubmit = downloadArchive;
+$("download-files").onchange = updateDownloadSelection;
+$("download-choose").onclick = chooseDownloadDestination;
+$("download-name").oninput = () => {
+  if (!archiveSaveFile) return;
+  archiveSaveFile = null;
+  $("download-destination").value = "檔名已變更，請重新選擇儲存位置";
+};
+$("download-cancel").onclick = () => $("download-dialog").close();
+$("download-dialog").oncancel = (e) => { if (archiveBusy) e.preventDefault(); };
+for (const [id, checked] of [["download-all", true], ["download-none", false]]) {
+  $(id).onclick = () => {
+    for (const cb of $("download-files").querySelectorAll("input")) cb.checked = checked;
+    updateDownloadSelection();
+  };
+}
+$("folder-create").onclick = () => manageFolder("create");
+$("folder-rename").onclick = () => manageFolder("rename");
+$("folder-delete").onclick = () => manageFolder("delete");
 $("scenario").innerHTML = SCENARIOS.map((s) => `<option>${esc(s)}</option>`).join("");
 $("phone").value = localStorage.getItem("phone") || "";
 $("btn-start").onclick = start;

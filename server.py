@@ -8,8 +8,11 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
+import tempfile
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CAP_ROOT = os.environ.get("BTCAP_DIR", os.path.join(HERE, "captures"))
@@ -179,6 +182,8 @@ def current_capture():
 
 def list_captures():
     items = []
+    with lock:
+        catalog = load_catalog()
     if not os.path.isdir(CAP_ROOT):
         return items
     for name in sorted(os.listdir(CAP_ROOT), reverse=True):
@@ -187,12 +192,13 @@ def list_captures():
             continue
         mp = os.path.join(d, "meta.json")
         try:
-            meta = json.load(open(mp, encoding="utf-8"))
+            with open(mp, encoding="utf-8") as f:
+                meta = json.load(f)
             incomplete = False
         except (OSError, ValueError):
             # 啟動失敗留下的目錄：仍列出來，讓使用者可以刪除
             meta, incomplete = {}, True
-        items.append({"id": name, "meta": meta, "incomplete": incomplete,
+        items.append({"id": name, "meta": meta, **catalog["captures"].get(name, {}), "incomplete": incomplete,
                       "analyzed": os.path.exists(os.path.join(d, "summary.json"))})
     return items
 
@@ -207,6 +213,106 @@ def delete_capture(cid):
     if cur and cur["id"] == cid:
         raise ValueError("這筆擷取正在進行中，請先停止再刪除")
     shutil.rmtree(d)
+    with lock:
+        catalog = load_catalog()
+        catalog["captures"].pop(cid, None)
+        save_catalog(catalog)
+
+
+# 分類使用獨立索引，不搬移原始擷取目錄，也不會被重新分析覆蓋。
+def load_catalog():
+    path = os.path.join(CAP_ROOT, ".catalog.json")
+    if not os.path.exists(path):
+        return {"folders": [], "captures": {}}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_catalog(catalog):
+    os.makedirs(CAP_ROOT, exist_ok=True)
+    path = os.path.join(CAP_ROOT, ".catalog.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(catalog, f, ensure_ascii=False, indent=2)
+    os.replace(path + ".tmp", path)
+
+
+def display_name(value, allow_empty=False):
+    if not isinstance(value, str):
+        raise ValueError("名稱必須是文字")
+    value = value.strip()
+    if (not value and not allow_empty) or len(value) > 120:
+        raise ValueError("名稱需為 1～120 字")
+    return value
+
+
+def update_organization(cid, body):
+    if not ID_RE.fullmatch(cid) or not os.path.isdir(os.path.join(CAP_ROOT, cid)):
+        raise ValueError("找不到紀錄")
+    with lock:
+        catalog = load_catalog()
+        item = dict(catalog["captures"].get(cid, {"name": "", "folder": ""}))
+        name = display_name(body["name"], allow_empty=True) if "name" in body else item.get("name", "")
+        folder = body.get("folder", item.get("folder", ""))
+        if not isinstance(folder, str):
+            raise ValueError("無效的分類資料夾")
+        if folder != "" and folder not in {f["id"] for f in catalog["folders"]}:
+            raise ValueError("找不到分類資料夾")
+        catalog["captures"][cid] = {"name": name, "folder": folder}
+        save_catalog(catalog)
+    return {"name": name, "folder": folder}
+
+
+def edit_folder(action, body):
+    with lock:
+        catalog = load_catalog()
+        folders = catalog["folders"]
+        folder = next((f for f in folders if f["id"] == body.get("id")), None)
+        if action != "create" and folder is None:
+            raise ValueError("找不到分類資料夾")
+        if action == "delete":
+            folders.remove(folder)
+            for item in catalog["captures"].values():
+                if item.get("folder") == folder["id"]:
+                    item["folder"] = ""
+        else:
+            name = display_name(body.get("name"))
+            if any(f["name"] == name and f is not folder for f in folders):
+                raise ValueError("已存在同名資料夾")
+            if action == "create":
+                folder = {"id": uuid.uuid4().hex, "name": name}
+                folders.append(folder)
+            else:
+                folder["name"] = name
+        save_catalog(catalog)
+        return folder
+
+
+def archive_name(value):
+    if isinstance(value, str):
+        value = value.strip()
+        if value.lower().endswith(".zip"):
+            value = value[:-4]
+    name = display_name(value)
+    if not name or name in (".", "..") or re.search(r'[\\/:*?"<>|\x00-\x1f]', name) or name.endswith((".", " ")):
+        raise ValueError("請輸入有效的 ZIP 檔名，不可包含路徑或特殊字元 \\ / : * ? \" < > |")
+    return name + ".zip"
+
+
+def capture_files(directory):
+    return [{"name": name, "size": os.path.getsize(os.path.join(directory, name))}
+            for name in sorted(DOWNLOADS) if os.path.isfile(os.path.join(directory, name))]
+
+
+def write_archive(directory, filenames, output):
+    if not isinstance(filenames, list) or not filenames or any(not isinstance(f, str) or f not in DOWNLOADS for f in filenames):
+        raise ValueError("請至少選擇一個有效的擷取檔案")
+    filenames = list(dict.fromkeys(filenames))
+    for name in filenames:
+        if not os.path.isfile(os.path.join(directory, name)):
+            raise ValueError("檔案不存在：" + name)
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in filenames:
+            archive.write(os.path.join(directory, name), arcname=name)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -252,6 +358,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"state": "capturing" if cur else "idle", "current": cur})
         if path == "/api/captures":
             return self.send_json(list_captures())
+        if path == "/api/folders":
+            with lock:
+                folders = load_catalog()["folders"]
+            return self.send_json(folders)
         if path == "/api/conn":
             return self.send_json({"host": get_host(), "env_locked": bool(os.environ.get("BTCAP_HOST"))})
         m = re.match(r"^/api/captures/([^/]+)(?:/([^/]+))?$", path)
@@ -260,11 +370,17 @@ class Handler(BaseHTTPRequestHandler):
             if d is None:
                 return self.send_json({"error": "找不到擷取"}, 404)
             fname = m.group(2)
+            if fname == "files":
+                return self.send_json(capture_files(d))
             if fname is None:
                 sp = os.path.join(d, "summary.json")
                 if not os.path.exists(sp):
                     return self.send_json({"error": "尚未分析"}, 404)
-                return self.send_file(sp, "application/json; charset=utf-8")
+                with open(sp, encoding="utf-8") as f:
+                    summary = json.load(f)
+                with lock:
+                    summary["organization"] = load_catalog()["captures"].get(m.group(1), {})
+                return self.send_json(summary)
             fp = os.path.join(d, fname)
             if fname not in DOWNLOADS or not os.path.exists(fp):
                 return self.send_json({"error": "找不到檔案"}, 404)
@@ -279,6 +395,31 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         try:
             body = self.read_body()
+            m = re.fullmatch(r"/api/captures/([^/]+)/archive", path)
+            if m:
+                d = self.capture_dir(m.group(1))
+                if d is None:
+                    return self.send_json({"error": "找不到擷取"}, 404)
+                name = archive_name(body.get("name", ""))
+                with tempfile.TemporaryFile() as output:
+                    write_archive(d, body.get("files"), output)
+                    size = output.tell()
+                    output.seek(0)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(size))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Disposition", "attachment; filename=logs.zip; filename*=UTF-8''" + quote(name, safe=""))
+                    self.end_headers()
+                    shutil.copyfileobj(output, self.wfile)
+                return
+            m = re.fullmatch(r"/api/folders/(create|rename|delete)", path)
+            if m:
+                folder = edit_folder(m.group(1), body)
+                return self.send_json({"ok": True, "folder": folder})
+            m = re.fullmatch(r"/api/captures/([^/]+)/organization", path)
+            if m:
+                return self.send_json({"ok": True, "organization": update_organization(m.group(1), body)})
             if path == "/api/conn/host":
                 host = check_host(body.get("host"))
                 if os.environ.get("BTCAP_HOST"):
@@ -324,7 +465,8 @@ class Handler(BaseHTTPRequestHandler):
                                    capture_output=True, text=True, timeout=300)
                 if p.returncode != 0:
                     raise RuntimeError(p.stdout + p.stderr)
-                s = json.load(open(os.path.join(d, "summary.json"), encoding="utf-8"))
+                with open(os.path.join(d, "summary.json"), encoding="utf-8") as f:
+                    s = json.load(f)
                 return self.send_json({"ok": True, "packets": s["capture"]["packets"],
                                        "connections": len(s["connections"]), "events": len(s["events"]),
                                        "warnings": s["warnings"]})

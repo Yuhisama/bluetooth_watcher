@@ -40,10 +40,55 @@ button.busy { pointer-events: none; opacity: .6; }
 #captures li.active { background: #dce9ff; }
 #captures li.empty { color: #999; cursor: default; }
 .cap-title { font-weight: bold; }
+.cap-title, .cap-sub { overflow-wrap: anywhere; }
+.cap-title { cursor: text; }
+.cap-title:focus-visible { outline: 2px solid #1f6feb; }
+.cap-name-input { margin: 0; padding: 2px 4px; font: inherit; font-weight: bold; }
+#captures li.dragging { opacity: .45; }
+.capture-help { color: #777; font-size: 12px; margin: 8px 0; }
+.folder-list { display: flex; flex-direction: column; gap: 3px; max-height: 25vh; overflow-y: auto; }
+.folder-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; text-align: left; padding: 7px 9px; border-color: transparent; }
+.folder-item span { overflow-wrap: anywhere; min-width: 0; }
+.folder-item small { color: #777; }
+.folder-item:hover { background: #f1f6ff; }
+.folder-item.selected { background: #dce9ff; color: #185abc; }
+.folder-item.drop-target { border: 2px dashed #1f6feb; background: #e3f5e5; }
+.folder-actions { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 8px; }
+.folder-actions button { padding: 4px 7px; font-size: 12px; }
 .cap-sub { font-size: 12px; color: #777; }
 .result-head h2 { margin: 0; font-size: 17px; }
 .sub { color: #777; font-size: 12px; margin: 4px 0; }
 .downloads { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 6px; font-size: 13px; }
+.download-log-button { background: #eaf2ff; border-color: #b7cff3; color: #185abc; font-weight: bold; }
+.download-log-button:hover { background: #dce9ff; }
+.download-dialog { width: min(580px, calc(100vw - 32px)); max-height: 90vh; overflow-y: auto; padding: 24px; border: 0; border-radius: 14px; box-shadow: 0 16px 64px #172b4d40; }
+.download-dialog::backdrop { background: #182b4d66; }
+.download-heading { display: flex; align-items: center; gap: 12px; }
+.download-heading h2 { margin: 0; font-size: 20px; }
+.download-heading .sub { overflow-wrap: anywhere; }
+.zip-icon { display: grid; place-items: center; flex-shrink: 0; width: 46px; height: 50px; border-radius: 10px; background: #eaf2ff; color: #1f6feb; font-size: 13px; font-weight: bold; letter-spacing: 1px; }
+.download-intro { color: #667085; margin: 16px 0; }
+.download-file-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.download-file-heading button { padding: 3px 7px; font-size: 12px; border: 0; color: #185abc; }
+.download-files { border: 1px solid #e0e6ef; border-radius: 9px; max-height: 300px; overflow-y: auto; }
+.download-file { display: flex; align-items: center; gap: 12px; padding: 10px 12px; margin: 0; cursor: pointer; border-bottom: 1px solid #eef1f5; }
+.download-file:last-child { border-bottom: 0; }
+.download-file:hover { background: #f5f9ff; }
+.download-file input { width: 16px; height: 16px; margin: 0; flex-shrink: 0; accent-color: #1f6feb; }
+.download-file > span:nth-child(2) { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.download-file strong { display: block; color: #344054; font-size: 13px; }
+.download-file small { display: block; color: #8993a3; margin-top: 3px; font-size: 12px; }
+.file-size { color: #8993a3; font-size: 12px; white-space: nowrap; }
+.download-dialog label[for] { margin: 16px 0 6px; font-weight: bold; color: #344054; }
+.archive-name-row, .destination-row { display: flex; align-items: center; gap: 8px; }
+.archive-name-row input, .destination-row input { margin: 0; min-width: 0; flex: 1; }
+.archive-name-row > span { color: #667085; padding: 0 4px; }
+.destination-row button { white-space: nowrap; padding: 6px 10px; font-size: 13px; }
+.destination-row input { color: #667085; background: #f8fafc; }
+.download-dialog .sub { font-size: 12px; line-height: 1.5; color: #8993a3; }
+.download-footer { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; border-top: 1px solid #edf0f4; margin-top: 20px; padding-top: 16px; }
+#download-status { flex: 1; color: #397252; font-size: 12px; }
+#download-error:empty { display: none; }
 .warn { background: #fff4d6; border: 1px solid #f0c36d; padding: 8px 10px; border-radius: 5px; margin-top: 10px; }
 .hint { color: #999; }
 .error { color: #c62828; }

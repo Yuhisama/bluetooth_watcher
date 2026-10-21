@@ -46,6 +46,13 @@
     </section>
     <section class="panel">
       <h2>擷取紀錄</h2>
+      <div class="folder-actions">
+        <button id="folder-create">新增資料夾</button>
+        <button id="folder-rename" disabled>改名</button>
+        <button id="folder-delete" disabled>刪除資料夾</button>
+      </div>
+      <div id="folders" class="folder-list" aria-label="分類資料夾"></div>
+      <p class="capture-help">雙擊名稱改名 · 拖曳紀錄到資料夾分類</p>
       <ul id="captures"></ul>
     </section>
   </aside>
@@ -53,6 +60,22 @@
     <p class="hint">選擇左側的擷取紀錄以檢視結果。</p>
   </section>
 </main>
+<dialog id="download-dialog" class="download-dialog" aria-labelledby="download-title">
+  <form id="download-form">
+    <div class="download-heading"><div class="zip-icon">ZIP</div><div><h2 id="download-title">下載 LOG</h2><p id="download-capture" class="sub"></p></div></div>
+    <p class="download-intro">選擇要匯出的檔案，打包成一個 ZIP 壓縮檔。</p>
+    <div class="download-file-heading"><strong>擷取檔案</strong><div><button type="button" id="download-all">全選</button><button type="button" id="download-none">取消全選</button></div></div>
+    <div id="download-files" class="download-files"></div>
+    <p id="download-selection" class="sub" aria-live="polite"></p>
+    <label for="download-name">壓縮檔名稱</label>
+    <div class="archive-name-row"><input id="download-name" maxlength="120" required autocomplete="off"><span>.zip</span></div>
+    <label for="download-destination">儲存目的地</label>
+    <div class="destination-row"><input id="download-destination" readonly value="瀏覽器預設下載位置"><button type="button" id="download-choose">選擇儲存位置…</button></div>
+    <p id="download-destination-hint" class="sub"></p>
+    <p id="download-error" class="error" role="alert"></p>
+    <div class="download-footer"><span id="download-status" aria-live="polite"></span><button type="button" id="download-cancel">取消</button><button type="submit" id="download-submit" class="primary">壓縮並下載</button></div>
+  </form>
+</dialog>
 <script src="app.js"></script>
 </body>
 </html>
