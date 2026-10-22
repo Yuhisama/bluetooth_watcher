@@ -1,18 +1,5 @@
 "use strict";
 
-const SCENARIOS = [
-  "首次配對（兩端清空）",
-  "從系統藍牙設定配對",
-  "從 App 內配對",
-  "App 關閉再開回連",
-  "手機藍牙關閉再開回連",
-  "儀表重開機回連",
-  "只有手機刪除配對",
-  "只有儀表刪除配對",
-  "走遠斷線再走回",
-  "其他",
-];
-
 const CATEGORY = {
   conn: { label: "連線", color: "#2e7d32" },
   disconnect: { label: "斷線", color: "#c62828" },
@@ -25,12 +12,13 @@ const CATEGORY = {
   cccd: { label: "CCCD", color: "#ef6c00" },
   gatt_write: { label: "GATT 寫入", color: "#283593" },
   notify: { label: "Notify", color: "#9e9d24" },
+  applog: { label: "App 日誌", color: "#607d8b" },
   error: { label: "錯誤", color: "#d50000" },
   mark: { label: "標記", color: "#f9a825" },
 };
 
 // 數量多的類別預設不勾選，也不畫在時間軸（時間軸已有 notify/s 長條）
-const DEFAULT_OFF = new Set(["notify"]);
+const DEFAULT_OFF = new Set(["notify", "applog"]);
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -40,8 +28,6 @@ let state = "idle";
 let currentId = null;
 let captureList = [];
 let folders = [];
-let selectedFolder = "*";
-const CAPTURE_DRAG_TYPE = "application/x-bt-capture";
 let downloadCaptureId = null;
 let downloadFiles = [];
 let archiveSaveFile = null;
@@ -94,14 +80,16 @@ function applyState(s) {
   $("btn-force-stop").disabled = forceClosing || (!capturing && !captureOperation);
   $("btn-mark").disabled = !capturing;
   $("mark-text").disabled = !capturing;
-  for (const id of ["scenario", "app", "phone"]) $(id).disabled = capturing;
+  $("capture-form").disabled = capturing;
   if (!$("conn-host").dataset.envLocked) $("conn-host").disabled = capturing;
+  const dot = $("tab-capture").querySelector(".tab-dot");
+  if (dot) dot.hidden = !capturing;
   const st = $("state");
   st.className = "state " + state;
   if (capturing) {
     const m = s.current.meta;
     const sec = Math.floor(s.current.elapsed);
-    st.textContent = `擷取中 ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}｜${m.scenario}｜${m.app}｜${m.phone}`;
+    st.textContent = `擷取中 ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}｜${m.scenario}｜${devicesSummary(m)}`;
   } else {
     st.textContent = "閒置";
   }
@@ -111,6 +99,7 @@ async function poll() {
   try {
     applyState(await api("/api/status"));
     $("host-status").textContent = "";
+    refreshLive();
   } catch (e) {
     $("host-status").textContent = "伺服器無回應";
   }
@@ -122,10 +111,12 @@ async function start() {
   busy(true);
   log("開始擷取…（SSH 連線、拍金鑰快照、啟動 btmon）");
   try {
-    const r = await api("/api/start", { scenario: $("scenario").value, app: $("app").value, phone: $("phone").value });
+    const devices = readDevices();
+    const r = await api("/api/start", { scenario: $("scenario").value.trim(), devices });
     if (captureOperation !== operation) return;
     log("已開始: " + r.output);
-    localStorage.setItem("phone", $("phone").value);
+    store.set("scenario", $("scenario").value.trim());
+    presets.last_devices = devices;
   } catch (e) {
     if (captureOperation === operation) log("開始失敗: " + e.message);
   }
@@ -145,7 +136,11 @@ async function stop() {
     if (captureOperation !== operation) return;
     log("完成: " + r.output);
     await loadCaptures();
-    if (r.id) openCapture(r.id);
+    if (r.id) {
+      lastFinishedId = r.id;
+      setTab("records");
+      openCapture(r.id);
+    }
   } catch (e) {
     if (captureOperation === operation) log("停止失敗: " + e.message + "；可按「強制關閉」解除狀態。");
   }
@@ -188,7 +183,189 @@ async function mark() {
   }
 }
 
-// ---------- 紀錄清單 ----------
+// ---------- 裝置 ----------
+const DEVICE_ICONS = { "手機": "📱", "MOB/FOB": "🛟", "耳機": "🎧" };
+const deviceIcon = (type) => DEVICE_ICONS[type] || "🔷";
+let presets = { favorites: [], device_sets: [], device_types: ["手機", "MOB/FOB", "耳機", "其他"], last_devices: [] };
+
+// 舊紀錄只有 phone/app 欄位，視為一支手機
+function metaDevices(m) {
+  if (m.devices?.length) return m.devices;
+  if (m.phone || m.app) return [{ type: "手機", name: m.phone || "", app: m.app || "" }];
+  return [];
+}
+
+const deviceLabel = (d) => `${deviceIcon(d.type)} ${d.name || d.type}`;
+const devicesSummary = (m) => metaDevices(m).map((d) => deviceLabel(d) + (d.app ? `（${d.app}）` : "")).join("、") || "未指定裝置";
+
+// 同一裝置的 LE（RPA）與 BR 連線以 identity address 合併成一組
+const connKey = (c) => c.identity_address || c.address;
+
+// 每組連線對應到哪個裝置：手動指定優先；否則用金鑰快照中的裝置名稱比對；
+// 只有一個裝置且只有一組連線時直接對應。index -1 表示「不屬於列出的裝置」。
+function resolvePeers(s) {
+  const devices = metaDevices(s.meta);
+  const manual = s.organization?.device_map || {};
+  const names = {};
+  for (const [addr, a] of Object.entries(s.adverts || {})) if (a.name) names[addr.toUpperCase()] = a.name;
+  // 金鑰快照：{before|after: {adapter: {address: {name}}}}，結束時的名稱優先
+  for (const snap of [s.keys?.before, s.keys?.after]) {
+    for (const devs of Object.values(snap || {})) {
+      for (const [addr, info] of Object.entries(devs)) if (info.name) names[addr.toUpperCase()] = info.name;
+    }
+  }
+  // IRK 交換前的 LE 連線沒有 identity；同一 RPA 之後若有連線解析出 identity，就沿用它
+  const identity = {};
+  for (const c of s.connections) if (c.identity_address) identity[c.address] = c.identity_address;
+  for (const c of s.connections) if (!c.identity_address && identity[c.address]) c.identity_address = identity[c.address];
+  const keys = [...new Set(s.connections.map(connKey))];
+  const peers = {};
+  for (const key of keys) {
+    const seen = names[key.toUpperCase()] || "";
+    const auto = !(key in manual);
+    let index = auto ? null : manual[key];
+    if (auto) {
+      const n = seen.toLowerCase();
+      const hit = n ? devices.findIndex((d) => d.name && (n.includes(d.name.toLowerCase()) || d.name.toLowerCase().includes(n))) : -1;
+      if (hit >= 0) index = hit;
+      else if (devices.length === 1 && keys.length === 1) index = 0;
+    }
+    const device = index != null && index >= 0 ? devices[index] : null;
+    // 裝置沒填名稱時（例如 FOB），用金鑰或廣播中的名稱
+    const label = device ? `${deviceIcon(device.type)} ${device.name || seen || device.type}` : `🔷 ${seen || key}`;
+    peers[key] = { key, index, auto, device, seen, label };
+  }
+  return peers;
+}
+
+function peerOf(s, e) {
+  const c = e.conn != null ? s.connections[e.conn] : null;
+  return c ? s.peers[connKey(c)] : null;
+}
+
+// ---------- 擷取表單：情境、裝置 ----------
+function renderScenarioOptions() {
+  const favorites = presets.favorites;
+  const recent = [...new Set(captureList.map((c) => c.meta.scenario).filter(Boolean))].filter((x) => !favorites.includes(x));
+  $("scenario-list").innerHTML = favorites.map((x) => `<option value="${esc(x)}">★ 最愛</option>`).join("") +
+    recent.map((x) => `<option value="${esc(x)}">最近使用</option>`).join("");
+  updateFavButton();
+}
+
+function updateFavButton() {
+  const on = presets.favorites.includes($("scenario").value.trim());
+  $("scenario-fav").textContent = on ? "★" : "☆";
+  $("scenario-fav").classList.toggle("on", on);
+}
+
+async function savePresets(changes) {
+  try {
+    presets = (await api("/api/presets", changes)).presets;
+  } catch (e) {
+    alert(e.status === 404 ? "伺服器尚未更新，請重啟 server.py 後再儲存。" : "儲存失敗: " + e.message);
+  }
+  renderScenarioOptions();
+  renderDeviceSets();
+}
+
+function toggleFavorite() {
+  const value = $("scenario").value.trim();
+  if (!value) return;
+  const favorites = presets.favorites.includes(value) ? presets.favorites.filter((x) => x !== value) : [value, ...presets.favorites];
+  savePresets({ favorites });
+}
+
+function renderDevices(devices) {
+  $("devices").innerHTML = devices.map((d) => {
+    const types = [...new Set([...presets.device_types, d.type].filter(Boolean))];
+    return `<div class="device-row">
+      <select data-f="type" aria-label="裝置類型">${types.map((t) => `<option${t === d.type ? " selected" : ""}>${esc(t)}</option>`).join("")}</select>
+      <input data-f="name" list="device-names" maxlength="120" placeholder="名稱，例如 iPhone 12" value="${esc(d.name || "")}">
+      <input data-f="app" list="device-apps" maxlength="120" placeholder="App（選填）" value="${esc(d.app || "")}">
+      <button type="button" data-remove title="移除">✕</button></div>`;
+  }).join("") || `<div class="devices-empty">未指定裝置</div>`;
+}
+
+// keepEmpty：編輯中保留空白列；送出時只留有名稱或 App 的裝置
+function readDevices(keepEmpty = false) {
+  return [...$("devices").querySelectorAll(".device-row")].map((row) => {
+    const d = {};
+    for (const el of row.querySelectorAll("[data-f]")) d[el.dataset.f] = el.value.trim();
+    return d;
+  }).filter((d) => keepEmpty || d.name || d.app);
+}
+
+function renderDeviceSets() {
+  const current = $("device-set").value;
+  $("device-set").innerHTML = `<option value="">套用裝置組合…</option>` +
+    presets.device_sets.map((x) => `<option value="${esc(x.name)}"${x.name === current ? " selected" : ""}>${esc(x.name)}</option>`).join("");
+  $("device-set-delete").disabled = !presets.device_sets.some((x) => x.name === $("device-set").value);
+}
+
+function saveDeviceSet() {
+  const devices = readDevices();
+  if (!devices.length) return alert("請先填入至少一個裝置");
+  const name = prompt("裝置組合名稱：", $("device-set").value || devices.map((d) => d.name || d.type).join(" + "));
+  if (!name?.trim()) return;
+  const sets = presets.device_sets.filter((x) => x.name !== name.trim());
+  savePresets({ device_sets: [...sets, { name: name.trim(), devices }] }).then(() => {
+    $("device-set").value = name.trim();
+    renderDeviceSets();
+  });
+}
+
+function deleteDeviceSet() {
+  const name = $("device-set").value;
+  if (!name || !confirm(`刪除裝置組合「${name}」？`)) return;
+  $("device-set").value = "";
+  savePresets({ device_sets: presets.device_sets.filter((x) => x.name !== name) });
+}
+
+function renderDeviceHints() {
+  const all = captureList.flatMap((c) => metaDevices(c.meta));
+  const uniq = (values) => [...new Set(values.filter(Boolean))];
+  $("device-names").innerHTML = uniq(all.map((d) => d.name)).map((x) => `<option value="${esc(x)}">`).join("");
+  $("device-apps").innerHTML = uniq(["客戶App", "nRF Connect", "系統設定", ...all.map((d) => d.app)]).map((x) => `<option value="${esc(x)}">`).join("");
+}
+
+async function initCaptureForm() {
+  try {
+    presets = { ...presets, ...(await api("/api/presets")) };
+  } catch (e) {
+    if (e.status !== 404) log("讀取最愛失敗: " + e.message);
+  }
+  $("scenario").value = store.get("scenario", "");
+  renderDevices(presets.last_devices.length ? presets.last_devices : [{ type: presets.device_types[0] }]);
+  renderDeviceSets();
+  renderScenarioOptions();
+  $("scenario").oninput = updateFavButton;
+  $("scenario-fav").onclick = toggleFavorite;
+  $("device-add").onclick = () => renderDevices([...readDevices(true), { type: presets.device_types[0] }]);
+  $("devices").onclick = (e) => {
+    const row = e.target.closest("[data-remove]")?.closest(".device-row");
+    if (!row) return;
+    row.remove();
+    if (!readDevices(true).length) renderDevices([]);
+  };
+  $("device-set").onchange = () => {
+    const set = presets.device_sets.find((x) => x.name === $("device-set").value);
+    if (set) renderDevices(set.devices);
+    renderDeviceSets();
+  };
+  $("device-set-save").onclick = saveDeviceSet;
+  $("device-set-delete").onclick = deleteDeviceSet;
+}
+
+// ---------- 紀錄樹 ----------
+// 資料夾以 parent 形成樹（"" 為根）；紀錄是葉節點，依 folder 掛在對應資料夾下。
+const store = {
+  get(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } },
+  set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} },
+};
+let expanded = new Set(store.get("tree-expanded", []));
+let treeSelection = null; // {type: "folder" | "capture", id}
+let treeFilter = "";
+
 async function loadCaptures() {
   const folderRequest = api("/api/folders").catch((e) => {
     if (e.status !== 404) throw e;
@@ -196,108 +373,101 @@ async function loadCaptures() {
     return [];
   });
   [captureList, folders] = await Promise.all([api("/api/captures"), folderRequest]);
-  if (selectedFolder !== "*" && selectedFolder !== "" && !folders.some((f) => f.id === selectedFolder)) selectedFolder = "*";
-  renderCaptures();
-  const phones = new Set(captureList.map((c) => c.meta.phone).filter(Boolean));
-  $("phones").innerHTML = [...phones].map((p) => `<option value="${esc(p)}">`).join("");
+  renderTree();
+  renderScenarioOptions();
+  renderDeviceHints();
 }
 
-function renderFolders() {
-  const entries = [{id: "*", name: "全部紀錄"}, {id: "", name: "未分類"}, ...folders];
-  $("folders").innerHTML = entries.map((f) => {
-    const count = captureList.filter((c) => f.id === "*" || (c.folder || "") === f.id).length;
-    return `<button class="folder-item${f.id === selectedFolder ? " selected" : ""}" data-folder="${esc(f.id)}" aria-pressed="${f.id === selectedFolder}" title="${f.id === "*" ? "檢視全部紀錄" : "點擊檢視，或拖曳紀錄到這裡"}"><span>${f.id === "*" ? "☰" : "📁"} ${esc(f.name)}</span><small>${count}</small></button>`;
-  }).join("");
-  for (const button of $("folders").querySelectorAll("[data-folder]")) {
-    const folder = button.dataset.folder;
-    button.onclick = () => { selectedFolder = folder; renderCaptures(); };
-    if (folder === "*") continue;
-    button.ondragover = (e) => {
-      if (!Array.from(e.dataTransfer.types).includes(CAPTURE_DRAG_TYPE)) return;
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      button.classList.add("drop-target");
-    };
-    button.ondragleave = (e) => {
-      if (!button.contains(e.relatedTarget)) button.classList.remove("drop-target");
-    };
-    button.ondrop = async (e) => {
-      e.preventDefault();
-      button.classList.remove("drop-target");
-      const id = e.dataTransfer.getData(CAPTURE_DRAG_TYPE);
-      if (!captureList.some((c) => c.id === id)) return;
-      try {
-        await saveOrganization(id, {folder});
-        log(`已移到「${entries.find((f) => f.id === folder).name}」`);
-      } catch (error) {
-        alert("移動失敗: " + error.message);
-      }
-    };
+const folderById = (id) => folders.find((f) => f.id === id);
+const folderParent = (f) => (folderById(f.parent) ? f.parent : "");
+const captureFolder = (c) => (folderById(c.folder) ? c.folder : "");
+const captureTitle = (c) => c.name || (c.incomplete ? "（不完整：擷取啟動失敗）" : c.meta.scenario) || c.id;
+
+function captureMatches(c, q) {
+  const devices = metaDevices(c.meta).flatMap((d) => [d.type, d.name, d.app]);
+  return [captureTitle(c), c.id, c.meta.scenario, ...devices].some((v) => String(v || "").toLowerCase().includes(q));
+}
+
+function treeRow(type, id, depth, twisty, icon, label, extra = "") {
+  const selected = treeSelection?.type === type && treeSelection.id === id;
+  const active = type === "capture" && id === currentId;
+  return `<div class="tree-row ${type}${extra}${selected ? " selected" : ""}${active ? " active" : ""}" data-type="${type}" data-id="${esc(id)}" draggable="true" style="--depth:${depth}">` +
+    `<span class="twisty">${twisty}</span><span class="tree-icon">${icon}</span><span class="tree-label">${label}</span></div>`;
+}
+
+function captureLabel(c) {
+  const t = c.meta.start_time ? new Date(c.meta.start_time * 1000).toLocaleString("zh-TW", { hour12: false }) : "";
+  const sub = c.incomplete ? esc(c.id) : `${esc(t)}｜${esc(devicesSummary(c.meta))}${c.analyzed ? "" : "｜未分析"}`;
+  return `<div class="cap-title tree-name" title="${esc(c.id)}">${esc(captureTitle(c))}</div><div class="cap-sub">${sub}</div>`;
+}
+
+function renderTree() {
+  const q = treeFilter.trim().toLowerCase();
+  const subFolders = new Map();
+  const captures = new Map();
+  const add = (map, key, value) => (map.get(key) || map.set(key, []).get(key)).push(value);
+  for (const f of [...folders].sort((a, b) => a.name.localeCompare(b.name, "zh-Hant"))) add(subFolders, folderParent(f), f);
+  for (const c of captureList) add(captures, captureFolder(c), c);
+  // 篩選時：資料夾名稱符合則顯示整個子樹；紀錄符合則顯示其上層資料夾並展開。
+  const build = (parentId, depth, inherited) => {
+    let html = "";
+    let count = 0;
+    for (const f of subFolders.get(parentId) || []) {
+      const hit = inherited || (q && f.name.toLowerCase().includes(q));
+      const sub = build(f.id, depth + 1, hit);
+      count += sub.count;
+      if (q && !hit && !sub.html) continue;
+      const open = q ? true : expanded.has(f.id);
+      const label = `<span class="tree-name">${esc(f.name)}</span> <span class="tree-count">${sub.count}</span>`;
+      html += `<li role="treeitem" aria-expanded="${open}">${treeRow("folder", f.id, depth, open ? "▾" : "▸", open ? "📂" : "📁", label)}` +
+        (open ? `<ul role="group">${sub.html}</ul>` : "") + "</li>";
+    }
+    for (const c of captures.get(parentId) || []) {
+      count++;
+      if (q && !inherited && !captureMatches(c, q)) continue;
+      html += `<li role="treeitem">${treeRow("capture", c.id, depth, "", c.incomplete ? "⚠️" : "📄", captureLabel(c), c.incomplete ? " incomplete" : "")}</li>`;
+    }
+    return { html, count };
+  };
+  $("tree").innerHTML = build("", 0, false).html || `<li class="tree-empty">${q ? "沒有符合的紀錄" : "尚無紀錄"}</li>`;
+}
+
+function selectTreeItem(type, id) {
+  treeSelection = type ? { type, id } : null;
+  for (const row of $("tree").querySelectorAll(".tree-row")) {
+    row.classList.toggle("selected", row.dataset.type === type && row.dataset.id === id);
   }
 }
 
-function renderCaptures() {
-  const selected = selectedFolder;
-  renderFolders();
-  const specificFolder = folders.some((f) => f.id === selected);
-  $("folder-rename").disabled = $("folder-delete").disabled = !specificFolder;
-  const list = captureList.filter((c) => selected === "*" || (c.folder || "") === selected);
-  $("captures").innerHTML = list.map((c) => {
-    const t = c.meta.start_time ? new Date(c.meta.start_time * 1000).toLocaleString("zh-TW", { hour12: false }) : c.id;
-    const title = c.name || (c.incomplete ? "（不完整：擷取啟動失敗）" : c.meta.scenario);
-    const folderName = folders.find((f) => f.id === c.folder)?.name || "未分類";
-    const sub = c.incomplete ? esc(c.id) : `${esc(t)}｜${esc(c.meta.app)}｜${esc(c.meta.phone)}${c.analyzed ? "" : "｜未分析"}`;
-    return `<li data-id="${esc(c.id)}" draggable="true" class="${c.id === currentId ? "active" : ""}${c.incomplete ? " incomplete" : ""}">
-      <button class="cap-del" title="刪除這筆紀錄" data-del="${esc(c.id)}">✕</button>
-      <div class="cap-title" tabindex="0" title="雙擊改名，或按 F2">${esc(title)}</div>
-      <div class="cap-sub">${sub}<br>📁 ${esc(folderName)}${c.incomplete ? "｜不完整" : ""}</div></li>`;
-  }).join("") || "<li class='empty'>此分類尚無紀錄</li>";
-  for (const li of $("captures").querySelectorAll("li[data-id]")) {
-    li.onclick = () => openCapture(li.dataset.id);
-    const title = li.querySelector(".cap-title");
-    title.ondblclick = (e) => { e.stopPropagation(); renameCapture(li.dataset.id, title); };
-    title.onkeydown = (e) => {
-      if (e.key === "F2") { e.preventDefault(); renameCapture(li.dataset.id, title); }
-    };
-    li.ondragstart = (e) => {
-      if (li.querySelector("input")) { e.preventDefault(); return; }
-      e.dataTransfer.setData(CAPTURE_DRAG_TYPE, li.dataset.id);
-      e.dataTransfer.effectAllowed = "move";
-      li.classList.add("dragging");
-    };
-    li.ondragend = () => {
-      li.classList.remove("dragging");
-      for (const target of $("folders").querySelectorAll(".drop-target")) target.classList.remove("drop-target");
-    };
-  }
-  for (const b of $("captures").querySelectorAll("button[data-del]")) {
-    b.onclick = (e) => { e.stopPropagation(); deleteCapture(b.dataset.del); };
-  }
+function toggleFolder(id, open = !expanded.has(id)) {
+  if (open) expanded.add(id); else expanded.delete(id);
+  store.set("tree-expanded", [...expanded]);
+  renderTree();
 }
 
-function renameCapture(id, title) {
-  const c = captureList.find((c) => c.id === id);
-  if (!c || title.querySelector("input")) return;
-  const original = title.textContent;
+function collapseAll() {
+  expanded.clear();
+  store.set("tree-expanded", []);
+  renderTree();
+}
+
+function inlineEdit(container, value, onSave) {
+  if (container.querySelector("input")) return;
+  const original = container.textContent;
   const input = document.createElement("input");
   input.className = "cap-name-input";
   input.maxLength = 120;
-  input.value = c.name || c.meta.scenario || "";
-  input.setAttribute("aria-label", "紀錄名稱");
-  input.title = "Enter 儲存，Esc 取消；留空恢復原名";
-  title.replaceChildren(input);
+  input.value = value;
+  input.setAttribute("aria-label", "名稱");
+  input.title = "Enter 儲存，Esc 取消";
+  container.replaceChildren(input);
   let finished = false;
-  const finish = async (cancel = false) => {
+  const finish = (cancel = false) => {
     if (finished) return;
     finished = true;
     const name = input.value.trim();
-    title.textContent = original;
-    if (cancel || name === (c.name || c.meta.scenario || "")) return;
-    try {
-      await saveOrganization(id, {name});
-    } catch (e) {
-      alert("改名失敗: " + e.message);
-    }
+    container.textContent = original;
+    if (!cancel && name !== value) onSave(name);
   };
   input.onclick = input.ondblclick = (e) => e.stopPropagation();
   input.onkeydown = (e) => {
@@ -313,31 +483,248 @@ function renameCapture(id, title) {
   input.select();
 }
 
+// 留空恢復原始情境名稱
+function renameCapture(id, title) {
+  const c = captureList.find((c) => c.id === id);
+  if (!c) return;
+  inlineEdit(title, c.name || c.meta.scenario || "", (name) =>
+    saveOrganization(id, { name }).catch((e) => alert("改名失敗: " + e.message)));
+}
+
 async function saveOrganization(id, changes) {
   await api(`/api/captures/${encodeURIComponent(id)}/organization`, changes);
   await loadCaptures();
   if (currentId === id) await openCapture(id);
 }
 
-async function manageFolder(action) {
-  const folder = folders.find((f) => f.id === selectedFolder);
-  const body = { id: folder?.id };
-  if (action === "delete") {
-    if (!folder || !confirm(`刪除分類資料夾「${folder.name}」？裡面的紀錄會移回「未分類」，擷取檔案會保留。`)) return;
-  } else {
-    const name = prompt(action === "create" ? "新增分類資料夾名稱：" : "修改分類資料夾名稱：", action === "rename" ? folder?.name : "");
-    if (name === null) return;
-    body.name = name;
-  }
+async function folderAction(action, body) {
   try {
-    await api(`/api/folders/${action}`, body);
+    const r = await api(`/api/folders/${action}`, body);
     await loadCaptures();
-    // 新增後保持目前清單，方便直接將現有紀錄拖進新資料夾。
-    renderCaptures();
-    if (currentId) await openCapture(currentId);
+    return r.folder;
   } catch (e) {
     alert("資料夾操作失敗: " + e.message);
+    return null;
   }
+}
+
+function renameFolder(id, nameEl) {
+  const f = folderById(id);
+  if (!f) return;
+  inlineEdit(nameEl, f.name, (name) => name && folderAction("rename", { id, name }));
+}
+
+// 在選取的資料夾（或選取紀錄所在的資料夾）中新增，建立後直接進入改名
+async function createFolder(parent) {
+  if (parent === undefined) {
+    const sel = treeSelection;
+    parent = sel?.type === "folder" ? sel.id : sel?.type === "capture" ? captureFolder(captureList.find((c) => c.id === sel.id) || {}) : "";
+  }
+  const siblings = new Set(folders.filter((f) => folderParent(f) === parent).map((f) => f.name));
+  let name = "新資料夾";
+  for (let i = 2; siblings.has(name); i++) name = `新資料夾 (${i})`;
+  if (parent) expanded.add(parent);
+  const folder = await folderAction("create", { name, parent });
+  if (!folder) return;
+  selectTreeItem("folder", folder.id);
+  const nameEl = $("tree").querySelector(`.tree-row.folder[data-id="${CSS.escape(folder.id)}"] .tree-name`);
+  if (nameEl) renameFolder(folder.id, nameEl);
+}
+
+async function deleteFolder(id) {
+  const f = folderById(id);
+  if (!f || !confirm(`刪除資料夾「${f.name}」？\n裡面的子資料夾與紀錄會移到上一層，擷取檔案會保留。`)) return;
+  if (treeSelection?.id === id) treeSelection = null;
+  await folderAction("delete", { id });
+}
+
+async function moveItem(type, id, folder) {
+  try {
+    if (type === "capture") {
+      if (captureFolder(captureList.find((c) => c.id === id) || {}) === folder) return;
+      await saveOrganization(id, { folder });
+    } else {
+      if (id === folder || folderParent(folderById(id) || {}) === folder) return;
+      await api("/api/folders/move", { id, parent: folder });
+      await loadCaptures();
+    }
+    if (folder && !expanded.has(folder)) toggleFolder(folder, true);
+    log(`已移到「${folderById(folder)?.name || "根目錄"}」`);
+  } catch (e) {
+    alert("移動失敗: " + e.message);
+  }
+}
+
+function renameSelection() {
+  const sel = treeSelection;
+  const row = sel && $("tree").querySelector(`.tree-row[data-type="${sel.type}"][data-id="${CSS.escape(sel.id)}"]`);
+  if (!row) return;
+  const nameEl = row.querySelector(".tree-name");
+  if (sel.type === "folder") renameFolder(sel.id, nameEl); else renameCapture(sel.id, nameEl);
+}
+
+function deleteSelection() {
+  const sel = treeSelection;
+  if (sel?.type === "folder") deleteFolder(sel.id);
+  else if (sel?.type === "capture") deleteCapture(sel.id);
+}
+
+// ---------- 右鍵選單 ----------
+function showContextMenu(x, y, items) {
+  const menu = $("ctx-menu");
+  menu.innerHTML = items.map((it, i) => it === "-" ? `<li class="sep"></li>` :
+    `<li role="menuitem" data-i="${i}" class="${it.danger ? "danger" : ""}">${esc(it.label)}${it.key ? `<kbd>${it.key}</kbd>` : ""}</li>`).join("");
+  menu.hidden = false;
+  menu.style.left = Math.min(x, innerWidth - menu.offsetWidth - 4) + "px";
+  menu.style.top = Math.min(y, innerHeight - menu.offsetHeight - 4) + "px";
+  menu.onclick = (e) => {
+    const li = e.target.closest("li[data-i]");
+    if (!li) return;
+    hideContextMenu();
+    items[Number(li.dataset.i)].run();
+  };
+}
+
+function hideContextMenu() {
+  $("ctx-menu").hidden = true;
+}
+
+function treeMenuItems(type, id) {
+  if (type === "folder") return [
+    { label: "新增子資料夾", run: () => createFolder(id) },
+    { label: "改名", key: "F2", run: renameSelection },
+    { label: "刪除資料夾", key: "Del", danger: true, run: () => deleteFolder(id) },
+    "-",
+    { label: "全部收合", run: collapseAll },
+  ];
+  if (type === "capture") return [
+    { label: "開啟", key: "Enter", run: () => openCapture(id) },
+    { label: "下載 LOG…", run: () => openDownload(id) },
+    { label: "改名", key: "F2", run: renameSelection },
+    "-",
+    { label: "刪除紀錄", key: "Del", danger: true, run: () => deleteCapture(id) },
+  ];
+  return [
+    { label: "新增資料夾", run: () => createFolder("") },
+    { label: "全部收合", run: collapseAll },
+  ];
+}
+
+// ---------- 樹的事件（委派，綁一次） ----------
+const TREE_DRAG_TYPE = "application/x-bt-tree";
+
+function initTree() {
+  const tree = $("tree");
+  const rowOf = (e) => e.target.closest(".tree-row");
+  tree.onclick = (e) => {
+    const row = rowOf(e);
+    if (!row || e.target.closest("input")) return;
+    selectTreeItem(row.dataset.type, row.dataset.id);
+    if (row.dataset.type === "folder") toggleFolder(row.dataset.id);
+    else openCapture(row.dataset.id);
+  };
+  tree.ondblclick = (e) => {
+    const row = rowOf(e);
+    if (row?.dataset.type === "capture" && e.target.closest(".tree-name")) renameSelection();
+  };
+  tree.oncontextmenu = (e) => {
+    e.preventDefault();
+    const row = rowOf(e);
+    if (row) selectTreeItem(row.dataset.type, row.dataset.id);
+    showContextMenu(e.clientX, e.clientY, treeMenuItems(row?.dataset.type, row?.dataset.id));
+  };
+  tree.onkeydown = (e) => {
+    if (e.target.closest("input")) return;
+    const rows = [...tree.querySelectorAll(".tree-row")];
+    const idx = rows.findIndex((r) => r.classList.contains("selected"));
+    const row = rows[idx];
+    const go = (r) => { if (r) { selectTreeItem(r.dataset.type, r.dataset.id); r.scrollIntoView({ block: "nearest" }); } };
+    if (e.key === "F2") renameSelection();
+    else if (e.key === "Delete") deleteSelection();
+    else if (e.key === "ArrowDown") go(rows[idx + 1] || rows[0]);
+    else if (e.key === "ArrowUp") go(rows[Math.max(idx - 1, 0)]);
+    else if (e.key === "Enter" && row) row.dataset.type === "folder" ? toggleFolder(row.dataset.id) : openCapture(row.dataset.id);
+    else if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && row?.dataset.type === "folder") toggleFolder(row.dataset.id, e.key === "ArrowRight");
+    else return;
+    e.preventDefault();
+  };
+  const clearDrop = () => {
+    tree.classList.remove("drop-root");
+    for (const r of tree.querySelectorAll(".drop-target")) r.classList.remove("drop-target");
+  };
+  tree.ondragstart = (e) => {
+    const row = rowOf(e);
+    if (!row || row.querySelector("input")) { e.preventDefault(); return; }
+    e.dataTransfer.setData(TREE_DRAG_TYPE, JSON.stringify({ type: row.dataset.type, id: row.dataset.id }));
+    e.dataTransfer.effectAllowed = "move";
+    row.classList.add("dragging");
+  };
+  tree.ondragend = (e) => {
+    rowOf(e)?.classList.remove("dragging");
+    clearDrop();
+  };
+  // 放在資料夾列上移入該資料夾；放在空白處移到根目錄
+  tree.ondragover = (e) => {
+    if (!Array.from(e.dataTransfer.types).includes(TREE_DRAG_TYPE)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    clearDrop();
+    const row = rowOf(e);
+    if (row?.dataset.type === "folder") row.classList.add("drop-target");
+    else if (!row) tree.classList.add("drop-root");
+  };
+  tree.ondragleave = (e) => { if (!tree.contains(e.relatedTarget)) clearDrop(); };
+  tree.ondrop = (e) => {
+    e.preventDefault();
+    clearDrop();
+    const row = rowOf(e);
+    if (row && row.dataset.type !== "folder") return;
+    let item;
+    try { item = JSON.parse(e.dataTransfer.getData(TREE_DRAG_TYPE)); } catch { return; }
+    moveItem(item.type, item.id, row ? row.dataset.id : "");
+  };
+  $("tree-filter").oninput = (e) => { treeFilter = e.target.value; renderTree(); };
+  $("tree-new-folder").onclick = () => createFolder();
+  $("tree-collapse").onclick = collapseAll;
+  addEventListener("mousedown", (e) => { if (!e.target.closest("#ctx-menu")) hideContextMenu(); });
+  addEventListener("keydown", (e) => { if (e.key === "Escape") hideContextMenu(); });
+  addEventListener("blur", hideContextMenu);
+}
+
+// ---------- 側欄頁籤與寬度 ----------
+function setTab(name) {
+  $("result").hidden = name !== "records";
+  $("live").hidden = name !== "capture";
+  for (const tab of ["capture", "records"]) {
+    $("pane-" + tab).hidden = tab !== name;
+    $("tab-" + tab).classList.toggle("active", tab === name);
+    $("tab-" + tab).setAttribute("aria-selected", tab === name);
+  }
+  store.set("side-tab", name);
+  if (name === "capture") refreshLive(true);
+}
+
+function initSidebar() {
+  for (const tab of ["capture", "records"]) $("tab-" + tab).onclick = () => setTab(tab);
+  setTab(store.get("side-tab", "records"));
+  const main = document.querySelector("main");
+  const setWidth = (w) => main.style.setProperty("--sidebar-w", Math.round(Math.max(240, Math.min(w, innerWidth * 0.6))) + "px");
+  setWidth(store.get("sidebar-w", 340));
+  const resizer = $("resizer");
+  resizer.onpointerdown = (e) => {
+    e.preventDefault();
+    resizer.setPointerCapture(e.pointerId);
+    resizer.classList.add("dragging");
+    document.body.classList.add("resizing");
+    const left = main.getBoundingClientRect().left + 14;
+    resizer.onpointermove = (ev) => setWidth(ev.clientX - left);
+    resizer.onpointerup = () => {
+      resizer.onpointermove = resizer.onpointerup = null;
+      resizer.classList.remove("dragging");
+      document.body.classList.remove("resizing");
+      store.set("sidebar-w", parseInt(main.style.getPropertyValue("--sidebar-w"), 10));
+    };
+  };
 }
 
 async function deleteCapture(id) {
@@ -357,7 +744,8 @@ async function deleteCapture(id) {
 
 async function openCapture(id) {
   currentId = id;
-  for (const li of $("captures").querySelectorAll("li")) li.classList.toggle("active", li.dataset.id === id);
+  selectTreeItem("capture", id);
+  for (const row of $("tree").querySelectorAll(".tree-row.capture")) row.classList.toggle("active", row.dataset.id === id);
   try {
     const s = await api(`/api/captures/${encodeURIComponent(id)}`);
     renderResult(id, s);
@@ -540,10 +928,12 @@ function renderResult(id, s) {
   const organization = s.organization || {};
   const folderName = folders.find((f) => f.id === organization.folder)?.name || "未分類";
   const off = m.clock_offset != null ? `儀表時鐘與電腦相差 ${fmtOffset(m.clock_offset)}` : "";
+  s.peers = resolvePeers(s);
+  const devicesText = devicesSummary(m);
 
   let html = `<div class="result-head">
-    <h2 class="cap-title" tabindex="0" title="雙擊改名，或按 F2">${organization.name ? esc(organization.name) : `${esc(m.scenario)}｜${esc(m.app)}｜${esc(m.phone)}`}</h2>
-    <div class="sub">📁 ${esc(folderName)}${organization.name ? `｜${esc(m.scenario)}｜${esc(m.app)}｜${esc(m.phone)}` : ""}</div>
+    <h2 class="cap-title" tabindex="0" title="雙擊改名，或按 F2">${esc(organization.name || m.scenario)}</h2>
+    <div class="sub">📁 ${esc(folderName)}${organization.name ? `｜${esc(m.scenario)}` : ""}｜${esc(devicesText)}</div>
     <div class="sub">${esc(id)}｜封包 ${s.capture.packets}｜${esc(off)}（時間軸使用儀表時鐘）</div>
     <div class="downloads"><button id="btn-download-log" class="download-log-button">↓ 下載 LOG</button>
       <button class="primary" onclick="toggleSimulator()">▶ 模擬動作</button>
@@ -573,6 +963,9 @@ function renderResult(id, s) {
   html += "<h3>CCCD 寫入</h3>" + eventTable(s.events.filter((e) => e.category === "cccd"), rel);
   html += "<h3>GATT 寫入（Control Point 等）</h3>" + eventTable(s.events.filter((e) => e.category === "gatt_write"), rel);
   html += "<h3>ATT 回覆（Error Response）</h3><p class='hint'>協定的 Error Response 不一定代表故障：查無屬性／探索結束與不支援的群組查詢分別標示，其他異常保留為錯誤。</p>" + eventTable(s.events.filter(isAttErrorResponse), rel);
+  html += "<h3>掃描到的廣播</h3><p class='hint'>連線中的空封包不經過 HCI，看不到；連線前後的廣播、RSSI 可在此觀察。藍底為本次有連線的裝置。</p>" + advertTable(s, rel);
+  html += `<h3>App 日誌（journal）</h3><input id="applog-filter" class="applog-filter" type="search" placeholder="篩選，例如 [FOB]、DISCONNECTED、Alarm">
+    <div id="applog">${eventTable(s.events.filter((e) => e.category === "applog"), rel)}</div>`;
   html += "<h3>金鑰快照差異（開始 → 結束）</h3>" + keyTable(s.keys);
   html += `<h3>全部事件</h3><div class="filters">${Object.entries(CATEGORY).map(([k, v]) =>
     `<label><input type="checkbox" data-cat="${k}"${DEFAULT_OFF.has(k) ? "" : " checked"}><span style="color:${v.color}">${v.label}</span></label>`).join("")}</div>
@@ -593,8 +986,18 @@ function renderResult(id, s) {
     $("all-events").innerHTML = eventTable(evs, rel);
   };
   window._updateAllEvents = updateAllEvents;
+  $("applog-filter").oninput = (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    $("applog").innerHTML = eventTable(s.events.filter((x) => x.category === "applog" && (!q || (x.title + " " + x.detail).toLowerCase().includes(q))), rel);
+  };
   for (const cb of document.querySelectorAll(".filters input")) cb.onchange = updateAllEvents;
   if ($("tl-sync-events")) $("tl-sync-events").onchange = updateAllEvents;
+  $("result").onchange = (e) => {
+    const select = e.target.closest("select.conn-device");
+    if (!select) return;
+    const value = select.value === "auto" ? null : Number(select.value);
+    saveOrganization(id, { device_map: { [select.dataset.key]: value } }).catch((err) => alert("儲存失敗: " + err.message));
+  };
   $("result").onclick = (e) => {
     const tr = e.target.closest("table.events tbody tr[data-idx]");
     if (!tr || !tlView) return;
@@ -615,19 +1018,30 @@ function isConnTransport(s, e, transport) {
   return s.connections[e.conn].transport === transport;
 }
 
-function connTable(s, rel) {
+function connTable(s, rel, live = false) {
   if (!s.connections.length) return "<p class='hint'>沒有連線</p>";
-  return `<div class="scroll"><table><thead><tr><th>#</th><th>傳輸層</th><th>Handle</th><th>位址</th><th>本機角色</th>
-    <th>開始</th><th>結束</th><th>加密</th><th>GATT 所在</th><th>ATT 封包</th><th>Notify</th><th>寫入</th><th>斷線原因</th></tr></thead><tbody>
+  const devices = metaDevices(s.meta);
+  const deviceSelect = (c) => {
+    const p = s.peers[connKey(c)];
+    const option = (value, label) => `<option value="${value}"${!p.auto && String(p.index) === String(value) ? " selected" : ""}>${esc(label)}</option>`;
+    if (live) return esc(p.label);
+    return `<select class="conn-device${p.auto ? " auto" : ""}" data-key="${esc(p.key)}" title="${p.seen ? "金鑰快照名稱：" + esc(p.seen) : "金鑰快照無名稱"}">
+      <option value="auto"${p.auto ? " selected" : ""}>${esc(p.auto ? `自動：${p.label}` : "自動對應")}</option>
+      ${devices.map((d, i) => option(i, deviceLabel(d))).join("")}${option(-1, "不屬於列出的裝置")}</select>`;
+  };
+  return `<div class="scroll"><table><thead><tr><th>#</th><th>裝置</th><th>傳輸層</th><th>Handle</th><th>位址</th><th>本機角色</th>
+    <th>開始</th><th>結束</th><th>加密</th><th>連線參數</th><th>RSSI</th><th>GATT 所在</th><th>ATT 封包</th><th>Notify</th><th>寫入</th><th>斷線原因</th></tr></thead><tbody>
     ${s.connections.map((c) => `<tr>
-      <td>${c.id}</td><td><span class="tag ${c.transport === "LE" ? "le" : "br"}">${c.transport}</span></td>
+      <td>${c.id}</td><td>${deviceSelect(c)}</td><td><span class="tag ${c.transport === "LE" ? "le" : "br"}">${c.transport}</span></td>
       <td>${hex4(c.handle)}</td>
       <td>${esc(c.address)}${c.address_type ? ` <small>${esc(c.address_type)}</small>` : ""}${c.identity_address ? `<br><small>identity ${esc(c.identity_address)}</small>` : ""}</td>
       <td>${esc(c.role || "-")}</td><td>${rel(c.start)}</td><td>${c.end ? rel(c.end) : "未結束"}</td>
       <td>${c.encrypted_at ? rel(c.encrypted_at) : "<span class='bad'>無</span>"}</td>
+      <td>${c.interval_ms != null ? `interval ${c.interval_ms.toFixed(2)} ms<br><small>latency ${c.latency}｜timeout ${c.supervision_ms} ms</small>` : "-"}</td>
+      <td>${rssiText(c.rssi)}</td>
       <td>${c.gatt ? `<span class="gatt">${esc(c.att_channel)}</span>` : "-"}</td>
       <td>${c.att_packets}</td><td>${c.notifications}</td><td>${c.writes}</td>
-      <td>${c.disconnect_reason_text ? `${esc(c.disconnect_reason_text)}<br><small>${c.disconnect_by === "local" ? "本機斷線" : "對端斷線"}</small>` : "-"}</td>
+      <td>${c.disconnect_reason_text ? `${esc(c.disconnect_reason_text)}<br><small>${c.disconnect_by === "local" ? "本機斷線" : "對端斷線"}</small>` : "-"}${c.last_rx_estimate ? `<br><small>推估最後收到封包 ${rel(c.last_rx_estimate)}</small>` : ""}</td>
     </tr>`).join("")}</tbody></table></div>`;
 }
 
@@ -639,6 +1053,81 @@ function eventTable(events, rel) {
       return `<tr class="${e.category}" data-idx="${e._idx ?? ""}" data-ts="${e.t}"><td>${rel(e.t)}</td><td>${fmtClock(e.t)}</td><td>${e.conn == null ? "-" : "#" + e.conn}</td>
         <td style="color:${c.color}">${c.label}</td><td>${esc(e.title)}</td><td>${esc(e.detail)}</td></tr>`;
     }).join("")}</tbody></table></div>`;
+}
+
+function rssiText(samples) {
+  if (!samples?.length) return "-";
+  const values = samples.map(([, r]) => r);
+  return `${Math.min(...values)}～${Math.max(...values)} dBm<br><small>${samples.length} 筆，最後 ${values[values.length - 1]}</small>`;
+}
+
+// RSSI 散點圖，橫軸為整段擷取時間，縱軸 -100～-20 dBm
+function sparkline(samples, t0, t1, w = 180, h = 26) {
+  if (!samples?.length) return "-";
+  const x = (t) => (t1 > t0 ? ((t - t0) / (t1 - t0)) * (w - 4) + 2 : w / 2);
+  const y = (r) => h - 2 - ((Math.max(-100, Math.min(-20, r)) + 100) / 80) * (h - 4);
+  return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${samples.map(([t, r]) =>
+    `<circle cx="${x(t).toFixed(1)}" cy="${y(r).toFixed(1)}" r="1.7"><title>${r} dBm</title></circle>`).join("")}</svg>`;
+}
+
+function advertTable(s, rel, limit = 0) {
+  const connected = new Set(s.connections.flatMap((c) => [c.address, c.identity_address]).filter(Boolean));
+  let rows = Object.entries(s.adverts || {}).sort(([a, x], [b, y]) => (connected.has(b) - connected.has(a)) || (y.count - x.count));
+  if (!rows.length) return "<p class='hint'>沒有掃描到廣播（儀表未掃描，或只作為 peripheral）</p>";
+  const more = limit && rows.length > limit ? rows.length - limit : 0;
+  if (limit) rows = rows.slice(0, limit);
+  return `<div class="scroll"><table><thead><tr><th>位址</th><th>名稱</th><th>次數</th><th>第一次</th><th>最後一次</th><th>RSSI</th><th>RSSI 變化</th></tr></thead><tbody>
+    ${rows.map(([addr, a]) => `<tr class="${connected.has(addr) ? "adv-connected" : ""}"><td>${esc(addr)}</td><td>${esc(a.name || "-")}</td><td>${a.count}</td>
+      <td>${rel(a.first)}</td><td>${rel(a.last)}</td><td>${rssiText(a.rssi)}</td><td>${sparkline(a.rssi, s.capture.first_ts, s.capture.last_ts)}</td></tr>`).join("")}
+    </tbody></table></div>${more ? `<p class="hint">另有 ${more} 個裝置未列出</p>` : ""}`;
+}
+
+// ---------- 即時擷取畫面 ----------
+let liveBusy = false;
+let liveAt = 0;
+let lastFinishedId = null;
+
+async function refreshLive(force = false) {
+  if ($("live").hidden || liveBusy || (!force && Date.now() - liveAt < 2000)) return;
+  if (state !== "capturing") return renderLiveIdle();
+  liveBusy = true;
+  try {
+    const r = await api("/api/live");
+    if (r.capturing) renderLive(r.summary); else renderLiveIdle();
+  } catch (e) {
+    $("live").innerHTML = `<p class="error">即時資料讀取失敗：${esc(e.status === 404 ? "伺服器尚未更新，請重啟 server.py" : e.message)}</p>`;
+  } finally {
+    liveBusy = false;
+    liveAt = Date.now();
+  }
+}
+
+function renderLiveIdle() {
+  if ($("live").dataset.mode === "idle") return;
+  $("live").dataset.mode = "idle";
+  $("live").innerHTML = `<div class="live-idle"><h2>即時擷取</h2>
+    <p>目前沒有擷取。在左側填好測試情境與裝置後按「開始擷取」，這裡會每 2 秒更新連線、事件與 App 日誌。</p>
+    ${lastFinishedId ? `<button id="live-open-last">開啟剛完成的紀錄</button>` : ""}</div>`;
+  if ($("live-open-last")) $("live-open-last").onclick = () => { setTab("records"); openCapture(lastFinishedId); };
+}
+
+function renderLive(s) {
+  $("live").dataset.mode = "live";
+  s.events.forEach((e, i) => (e._idx = i));
+  s.peers = resolvePeers(s);
+  const base = s.capture.first_ts;
+  const rel = (t) => (base == null ? "" : "+" + (t - base).toFixed(3) + "s");
+  const sec = Math.floor(s.live.elapsed);
+  const recent = (filter, n) => s.events.filter(filter).slice(-n).reverse();
+  $("live").innerHTML = `<div class="result-head">
+      <h2><i class="live-badge"></i>擷取中 ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}｜${esc(s.meta.scenario || "")}</h2>
+      <div class="sub">${esc(devicesSummary(s.meta))}</div>
+      <div class="sub">${esc(s.live.id)}｜封包 ${s.capture.packets}｜每 2 秒更新，最新的在最上面</div></div>
+    ${s.warnings.length ? `<div class="warn">${s.warnings.map(esc).join("<br>")}</div>` : ""}
+    <h3>連線</h3>${connTable(s, rel, true)}
+    <h3>最新事件</h3>${eventTable(recent((e) => !DEFAULT_OFF.has(e.category), 40), rel)}
+    <h3>App 日誌</h3>${eventTable(recent((e) => e.category === "applog", 30), rel)}
+    <h3>掃描到的廣播</h3>${advertTable(s, rel, 8)}`;
 }
 
 function keyTable(keys) {
@@ -741,7 +1230,7 @@ function drawTimeline() {
     const c = r.conn;
     if (c) {
       parts.push(`<text x="6" y="${y + 21}" class="rowlabel">#${c.id} ${c.transport} ${hex4(c.handle)}${c.gatt ? " [GATT]" : ""}</text>`);
-      parts.push(`<text x="6" y="${y + 31}" class="rowsub">${esc(c.address)}</text>`);
+      parts.push(`<text x="6" y="${y + 31}" class="rowsub">${esc((s.peers?.[connKey(c)]?.label || "") + " " + c.address)}</text>`);
       const cs = Math.max(c.start, v0), ce = Math.min(c.end ?? t1, v1);
       if (ce >= v0 && cs <= v1) {
         const xs = x(cs), xe = x(ce);
@@ -1038,30 +1527,36 @@ function bindTimelineEvents(el, LABEL, plotW, TOP, mainH, miniTop, MINI_H, ROW) 
   });
 }
 
-// ---------- 視覺化模擬動作（儀表 ⇄ 手機 封包互傳動畫） ----------
+// ---------- 視覺化模擬動作（儀表 ⇄ 各裝置 封包互傳動畫） ----------
 let simState = null;
 
+// dir：m2p 儀表發出、p2m 對端發出；label 用該連線對應的裝置名稱
 function inferDirection(s, e) {
   const title = e.title || "", detail = e.detail || "";
+  const peer = peerOf(s, e)?.label || "對端";
+  const out = { dir: "m2p", label: `儀表 ➔ ${peer}` };
+  const into = { dir: "p2m", label: `${peer} ➔ 儀表` };
   if (e.category === "mark") return { dir: "mark", label: "現場標記" };
-  if (detail.includes("本機→對端") || title.includes("（本機）") || title.includes("（本機 發出）") || detail.startsWith("本機發起")) {
-    return { dir: "m2p", label: "儀表 ➔ 手機" };
-  }
-  if (detail.includes("對端→本機") || title.includes("（對端）") || title.includes("（對端 發出）") || detail.startsWith("對端發起")) {
-    return { dir: "p2m", label: "手機 ➔ 儀表" };
-  }
-  if (/本機要求斷線|Link Key Request Reply|Link Key Request Negative Reply|本機 IO Capability|IO Capability Negative Reply|User Confirmation 接受|User Confirmation 拒絕|Authentication Requested|Set Connection Encryption|LE Start Encryption|LTK Request Reply|LTK Request Negative Reply/.test(title)) {
-    return { dir: "m2p", label: "儀表 ➔ 手機" };
-  }
-  if (/對端 IO Capability|Link Key Request|IO Capability Request|User Confirmation Request|LE LTK Request/.test(title)) {
-    return { dir: "p2m", label: "手機 ➔ 儀表" };
-  }
+  if (detail.includes("本機→對端") || title.includes("（本機）") || title.includes("（本機 發出）") || detail.startsWith("本機發起")) return out;
+  if (detail.includes("對端→本機") || title.includes("（對端）") || title.includes("（對端 發出）") || detail.startsWith("對端發起")) return into;
+  if (/本機要求斷線|Link Key Request Reply|Link Key Request Negative Reply|本機 IO Capability|IO Capability Negative Reply|User Confirmation 接受|User Confirmation 拒絕|Authentication Requested|Set Connection Encryption|LE Start Encryption|LTK Request Reply|LTK Request Negative Reply/.test(title)) return out;
+  if (/對端 IO Capability|Link Key Request|IO Capability Request|User Confirmation Request|LE LTK Request/.test(title)) return into;
   if (e.category === "disconnect") {
     const c = e.conn != null ? s.connections[e.conn] : null;
-    if (c && c.disconnect_by === "local") return { dir: "m2p", label: "儀表主動斷線 ➔" };
-    if (c && c.disconnect_by === "remote") return { dir: "p2m", label: "⬅ 手機端斷線/超時" };
+    if (c && c.disconnect_by === "local") return { dir: "m2p", label: `儀表主動斷線 ➔ ${peer}` };
+    if (c && c.disconnect_by === "remote") return { dir: "p2m", label: `⬅ ${peer} 斷線/超時` };
   }
   return { dir: "both", label: "雙向 / 狀態變更" };
+}
+
+// 模擬器中每組連線（裝置）一列；沒有連線時用第一個裝置佔位
+function simPeers(s) {
+  const peers = [...new Set(s.connections.map(connKey))].map((key) => ({
+    ...s.peers[key], transports: [...new Set(s.connections.filter((c) => connKey(c) === key).map((c) => c.transport))],
+  }));
+  if (peers.length) return peers;
+  const d = metaDevices(s.meta)[0];
+  return [{ key: "", label: d ? deviceLabel(d) : "📱 對端", device: d, transports: ["BR/EDR", "LE"] }];
 }
 
 function stopSimTimer() {
@@ -1092,8 +1587,13 @@ function toggleSimulator() {
   simState = { s, list, idx: 0, playing: false, speed: 1, mode: "step", timer: null };
   panel.style.display = "";
 
-  const phoneName = s.meta.phone || "手機";
-  const appName = s.meta.app ? `（${s.meta.app}）` : "";
+  simState.peers = simPeers(s);
+  const lane = (i, t) => {
+    const k = t === "LE" ? "le" : "br";
+    return `<div class="sim-lane ${k}" id="sim-lane-${i}-${k}">
+      <div class="sim-lane-head"><span class="tag ${k}">${t === "LE" ? "BLE 低功耗藍牙" : "BR/EDR 傳統藍牙"}</span> <span id="sim-${i}-${k}-status" class="sim-lane-st">未連線</span></div>
+      <div class="sim-track"><div class="sim-line"></div><div id="sim-pkt-${i}-${k}" class="sim-pkt-wrap"></div></div></div>`;
+  };
   panel.innerHTML = `
     <div class="sim-bar">
       <div class="sim-controls">
@@ -1128,22 +1628,15 @@ function toggleSimulator() {
         <div class="sim-node-sub">${esc(s.meta.host || "hci0")}</div>
         <div id="sim-meter-state" class="sim-node-state">待機</div>
       </div>
-      <div class="sim-lanes">
-        <div class="sim-lane" id="sim-lane-br">
-          <div class="sim-lane-head"><span class="tag br">BR/EDR 傳統藍牙</span> <span id="sim-br-status" class="sim-lane-st">未連線</span></div>
-          <div class="sim-track" id="sim-track-br"><div class="sim-line"></div><div id="sim-pkt-br" class="sim-pkt-wrap"></div></div>
-        </div>
-        <div class="sim-lane" id="sim-lane-le">
-          <div class="sim-lane-head"><span class="tag le">BLE 低功耗藍牙</span> <span id="sim-le-status" class="sim-lane-st">未連線</span></div>
-          <div class="sim-track" id="sim-track-le"><div class="sim-line"></div><div id="sim-pkt-le" class="sim-pkt-wrap"></div></div>
-        </div>
+      <div class="sim-peers">
+        ${simState.peers.map((p, i) => `<div class="sim-peer">
+          <div class="sim-lanes">${["BR/EDR", "LE"].filter((t) => p.transports.includes(t)).map((t) => lane(i, t)).join("")}</div>
+          <div class="sim-node phone">
+            <div class="sim-node-title">${esc(p.label)}</div>
+            <div class="sim-node-sub">${esc([p.device?.app, p.key].filter(Boolean).join("｜") || "對端")}</div>
+            <div id="sim-peer-state-${i}" class="sim-node-state">待機</div>
+          </div></div>`).join("")}
         <div id="sim-banner" class="sim-banner"></div>
-      </div>
-      <div class="sim-node phone">
-        <div class="sim-icon">📱</div>
-        <div class="sim-node-title">${esc(phoneName)}</div>
-        <div class="sim-node-sub">對端${esc(appName)}</div>
-        <div id="sim-phone-state" class="sim-node-state">待機</div>
       </div>
     </div>
     <div class="sim-feed-head">封包與事件紀錄流（點擊任一列可跳至該步驟）</div>
@@ -1206,47 +1699,44 @@ function renderSimStep(idx) {
   if ($("sim-slider")) $("sim-slider").value = idx;
   if ($("sim-step-lbl")) $("sim-step-lbl").textContent = `${idx + 1} / ${list.length}（${rel}）`;
 
-  // 計算截至目前時間點 t 的 BR/EDR 與 LE 連線狀態
-  const activeState = (transport) => {
-    const conns = s.connections.filter((c) => c.transport === transport && c.start <= e.t + 1e-6 && (c.end == null || c.end >= e.t - 1e-6));
-    if (!conns.length) return { open: false, enc: false, gatt: false, text: "未連線" };
+  // 計算截至目前時間點各裝置 BR/EDR 與 LE 連線狀態
+  const activeState = (key, transport) => {
+    const conns = s.connections.filter((c) => connKey(c) === key && c.transport === transport && c.start <= e.t + 1e-6 && (c.end == null || c.end >= e.t - 1e-6));
+    if (!conns.length) return { open: false, enc: false, text: "未連線" };
     const c = conns[conns.length - 1];
     const enc = c.encrypted_at != null && c.encrypted_at <= e.t + 1e-6;
     const gatt = c.gatt && (transport === "LE" || s.events.some((x) => x.conn === c.id && x.category === "att" && x.t <= e.t + 1e-6));
-    return {
-      open: true, enc, gatt, conn: c,
-      text: `#${c.id} 連線中 (${hex4(c.handle)})${enc ? " 🔒已加密" : " 🔓未加密"}${gatt ? " 📡GATT" : ""}`
-    };
+    return { open: true, enc, text: `#${c.id} 連線中 (${hex4(c.handle)})${enc ? " 🔒已加密" : " 🔓未加密"}${gatt ? " 📡GATT" : ""}` };
   };
-  const brSt = activeState("BR/EDR");
-  const leSt = activeState("LE");
+  simState.peers.forEach((p, i) => {
+    for (const t of p.transports) {
+      const k = t === "LE" ? "le" : "br";
+      const lane = $(`sim-lane-${i}-${k}`), lbl = $(`sim-${i}-${k}-status`), wrap = $(`sim-pkt-${i}-${k}`);
+      if (!lane) continue;
+      const st = activeState(p.key, t);
+      lane.classList.toggle("active", st.open);
+      lane.classList.toggle("encrypted", st.enc);
+      lbl.textContent = st.text;
+      wrap.innerHTML = "";
+    }
+  });
 
-  const setLane = (id, st) => {
-    const lane = $("sim-lane-" + id), lbl = $("sim-" + id + "-status");
-    if (!lane || !lbl) return;
-    lane.classList.toggle("active", st.open);
-    lane.classList.toggle("encrypted", st.enc);
-    lbl.textContent = st.text;
-  };
-  setLane("br", brSt);
-  setLane("le", leSt);
-
-  // 判斷本事件屬於哪一條通道與傳送方向
+  // 判斷本事件屬於哪個裝置、哪一條通道與傳送方向；無連線的事件在只有一個裝置時歸給它
   const conn = e.conn != null ? s.connections[e.conn] : null;
-  const laneKey = conn ? (conn.transport === "LE" ? "le" : "br") : (e.category === "pair_le" ? "le" : "br");
+  const peerIdx = conn ? simState.peers.findIndex((p) => p.key === connKey(conn)) : simState.peers.length === 1 ? 0 : -1;
+  const transport = conn ? conn.transport : e.category === "pair_le" ? "LE" : "BR/EDR";
+  const laneKey = transport === "LE" ? "le" : "br";
   const dirInfo = inferDirection(s, e);
   const cat = CATEGORY[e.category] || { label: e.category, color: "#555" };
 
-  $("sim-pkt-br").innerHTML = "";
-  $("sim-pkt-le").innerHTML = "";
+  const sendRecv = (sender) => dirInfo.dir === "both" ? "⚡ 狀態更新" : (dirInfo.dir === "m2p") === sender ? "📤 發送封包" : "📥 接收封包";
+  if ($("sim-meter-state")) $("sim-meter-state").textContent = sendRecv(true);
+  simState.peers.forEach((p, i) => {
+    if ($("sim-peer-state-" + i)) $("sim-peer-state-" + i).textContent = i === peerIdx ? sendRecv(false) : "待機";
+  });
 
-  if ($("sim-meter-state") && $("sim-phone-state")) {
-    $("sim-meter-state").textContent = dirInfo.dir === "m2p" ? "📤 發送封包" : dirInfo.dir === "p2m" ? "📥 接收封包" : "⚡ 狀態更新";
-    $("sim-phone-state").textContent = dirInfo.dir === "p2m" ? "📤 發送封包" : dirInfo.dir === "m2p" ? "📥 接收封包" : "⚡ 狀態更新";
-  }
-
-  // 在對應通道上播放飛行封包動畫
-  const pktWrap = $("sim-pkt-" + laneKey);
+  // 在對應裝置的通道上播放飛行封包動畫
+  const pktWrap = peerIdx >= 0 ? $(`sim-pkt-${peerIdx}-${laneKey}`) : null;
   if (pktWrap && e.category !== "mark") {
     const arrow = dirInfo.dir === "m2p" ? "➔" : dirInfo.dir === "p2m" ? "⬅" : "⇄";
     pktWrap.innerHTML = `<div class="sim-packet ${dirInfo.dir}" style="--pkt-color:${cat.color}">
@@ -1277,7 +1767,7 @@ function renderSimStep(idx) {
       const d = inferDirection(s, ev);
       const c = CATEGORY[ev.category] || { label: ev.category, color: "#555" };
       const r = "+" + (ev.t - base).toFixed(3) + "s";
-      const arrow = d.dir === "m2p" ? "儀表 ➔ 手機" : d.dir === "p2m" ? "儀表 ⬅ 手機" : d.dir === "mark" ? "⚑ 標記" : "儀表 ⇄ 手機";
+      const arrow = d.dir === "mark" ? "⚑ 標記" : d.dir === "both" ? `儀表 ⇄ ${peerOf(s, ev)?.label || "對端"}` : d.label;
       return `<div class="sim-feed-row${realIdx === idx ? " current" : ""}" data-sidx="${realIdx}">
         <span class="sim-f-step">#${realIdx + 1}</span>
         <span class="sim-f-time">${esc(r)}</span>
@@ -1402,11 +1892,9 @@ for (const [id, checked] of [["download-all", true], ["download-none", false]]) 
     updateDownloadSelection();
   };
 }
-$("folder-create").onclick = () => manageFolder("create");
-$("folder-rename").onclick = () => manageFolder("rename");
-$("folder-delete").onclick = () => manageFolder("delete");
-$("scenario").innerHTML = SCENARIOS.map((s) => `<option>${esc(s)}</option>`).join("");
-$("phone").value = localStorage.getItem("phone") || "";
+initSidebar();
+initTree();
+initCaptureForm();
 $("btn-start").onclick = start;
 $("btn-stop").onclick = stop;
 $("btn-force-stop").onclick = forceStop;

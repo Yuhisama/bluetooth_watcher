@@ -5,6 +5,8 @@
 用法: analyze.py <capture_dir>
 """
 import configparser
+import datetime
+import re
 import io
 import json
 import os
@@ -104,6 +106,15 @@ def hex_data(b, limit=20):
     return text + (" …（共 %d bytes）" % len(b) if len(b) > limit else "")
 
 
+def meta_devices(meta):
+    # 舊紀錄只有 phone/app 欄位，視為一支手機
+    if meta.get("devices"):
+        return meta["devices"]
+    if meta.get("phone") or meta.get("app"):
+        return [{"type": "手機", "name": meta.get("phone", ""), "app": meta.get("app", "")}]
+    return []
+
+
 def classify_att_error(req_op, err):
     # ATT 用 Error Response 表達查無結果；不能將所有 Error Response 視為故障。
     if err == 0x0A and req_op in (0x04, 0x06, 0x08, 0x10):
@@ -121,6 +132,7 @@ class Analyzer:
         self.att_errors = []
         self.warnings = []
         self.cccd_handles = set()
+        self.adverts = {}            # 位址 → 廣播統計與 RSSI 取樣
         self.char_uuids = {}         # (連線 id, 伺服器是否為本機, value handle) → UUID
         self.pending_read_type = {}  # (連線 id, 請求方向 tx) → Read By Type 查詢的屬性類型
         self.pending_l2cap = {}
@@ -158,6 +170,8 @@ class Analyzer:
             "encrypted_at": None, "att_channel": None,
             "att_packets": 0, "notifications": 0, "indications": 0, "writes": 0,
             "att_rx_cids": [], "att_tx_cids": [], "notify_buckets": {},
+            "interval_ms": None, "latency": None, "supervision_ms": None, "last_rx_estimate": None,
+            "rssi": [],
         }
         if transport == "LE":
             c["att_channel"] = "LE CID 0x0004"
@@ -288,6 +302,11 @@ class Analyzer:
             c["disconnect_by"] = "local" if handle in self.pending_disconnect or reason == 0x16 else "remote"
             self.pending_disconnect.pop(handle, None)
             self.event(t, c, "disconnect", "%s 斷線" % c["transport"], c["disconnect_reason_text"])
+            if reason == 0x08 and c["supervision_ms"]:
+                # 控制器層的空封包不經過 HCI；只能由 supervision timeout 回推最後一次收到對端封包
+                c["last_rx_estimate"] = t - c["supervision_ms"] / 1000
+                self.event(c["last_rx_estimate"], c, "disconnect", "推估最後收到對端封包",
+                           "Supervision Timeout %d ms 回推（斷線前 %.3f s）" % (c["supervision_ms"], c["supervision_ms"] / 1000))
         elif code == 0x06:
             status, handle = struct.unpack("<BH", a[:3])
             c = self.open_by_handle.get(handle & 0x0FFF)
@@ -331,6 +350,12 @@ class Analyzer:
             addr = bdaddr(a[1:7])
             self.event(t, self.conn_by_addr(addr, "BR/EDR"), "pair_br" if status == 0 else "error",
                        "Simple Pairing Complete", hex_reason(status, DISCONNECT_REASONS))
+        elif code == 0x0E and len(a) >= 7:
+            op = struct.unpack("<H", a[1:3])[0]
+            if op == 0x1405 and a[3] == 0:
+                c = self.open_by_handle.get(struct.unpack("<H", a[4:6])[0] & 0x0FFF)
+                if c is not None:
+                    c["rssi"].append([t, struct.unpack("<b", a[6:7])[0]])
         elif code == 0x3E:
             self.on_le_meta(t, a)
 
@@ -344,10 +369,57 @@ class Analyzer:
                 return
             atype_s = {0: "public", 1: "random", 2: "public-id", 3: "random-id"}.get(atype, str(atype))
             c = self.new_conn(t, handle & 0x0FFF, "LE", addr, atype_s, "central" if role == 0 else "peripheral")
-            self.event(t, c, "conn", "LE 連線建立", "%s (%s), 本機角色 %s" % (addr, atype_s, c["role"]))
+            # Enhanced 版本在 peer address 後多了本機／對端 RPA 共 12 bytes
+            self.set_conn_params(c, a[12 if sub == 0x01 else 24:])
+            self.event(t, c, "conn", "LE 連線建立", "%s (%s), 本機角色 %s, %s" % (addr, atype_s, c["role"], self.params_text(c)))
+        elif sub == 0x03 and len(a) >= 10:
+            status, handle = struct.unpack("<BH", a[1:4])
+            c = self.open_by_handle.get(handle & 0x0FFF)
+            if status == 0 and c is not None:
+                self.set_conn_params(c, a[4:])
+                self.event(t, c, "conn", "LE 連線參數更新", self.params_text(c))
+        elif sub == 0x02 and len(a) >= 2:
+            off = 2
+            for _ in range(a[1]):
+                atype, addr, dlen = a[off + 1], bdaddr(a[off + 2:off + 8]), a[off + 8]
+                data = a[off + 9:off + 9 + dlen]
+                self.on_advert(t, addr, data, struct.unpack("<b", a[off + 9 + dlen:off + 10 + dlen])[0])
+                off += 10 + dlen
+        elif sub == 0x0D and len(a) >= 2:
+            off = 2
+            for _ in range(a[1]):
+                addr, rssi, dlen = bdaddr(a[off + 3:off + 9]), struct.unpack("<b", a[off + 13:off + 14])[0], a[off + 23]
+                self.on_advert(t, addr, a[off + 24:off + 24 + dlen], rssi)
+                off += 24 + dlen
         elif sub == 0x05:
             handle = struct.unpack("<H", a[1:3])[0] & 0x0FFF
             self.event(t, self.open_by_handle.get(handle), "pair_le", "LE LTK Request", "")
+
+    def set_conn_params(self, c, p):
+        if len(p) >= 6:
+            interval, latency, timeout = struct.unpack("<HHH", p[:6])
+            c["interval_ms"], c["latency"], c["supervision_ms"] = interval * 1.25, latency, timeout * 10
+
+    @staticmethod
+    def params_text(c):
+        return "interval %.2f ms, latency %d, supervision timeout %d ms" % (c["interval_ms"], c["latency"], c["supervision_ms"])
+
+    MAX_ADVERT_SAMPLES = 500
+
+    def on_advert(self, t, addr, data, rssi):
+        a = self.adverts.setdefault(addr, {"name": "", "count": 0, "first": t, "last": t, "rssi": []})
+        a["count"] += 1
+        a["last"] = t
+        if rssi != 127 and len(a["rssi"]) < self.MAX_ADVERT_SAMPLES:
+            a["rssi"].append([t, rssi])
+        i = 0
+        while i + 1 < len(data):
+            n, kind = data[i], data[i + 1]
+            if n == 0:
+                break
+            if kind in (0x08, 0x09) and not (kind == 0x08 and a["name"]):
+                a["name"] = bytes(data[i + 2:i + 1 + n]).decode("utf-8", "replace")
+            i += 1 + n
 
     # ---------- ACL / L2CAP ----------
     def on_acl(self, t, p, tx):
@@ -613,6 +685,41 @@ def load_marks(path):
     return marks
 
 
+JOURNAL_RE = re.compile(r"^(\w{3} +\d+ [\d:.]+) \S+ ([^:\[]+)(?:\[\d+\])?: (.*)$")
+
+
+def load_journal(path, device_start):
+    """device_start：擷取開始時的儀表 epoch，用來推算年份與時區（journalctl 從開始時才輸出）。"""
+    if not os.path.exists(path) or device_start is None:
+        return []
+    rows = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        m = JOURNAL_RE.match(line.rstrip("\n"))
+        if m:
+            rows.append(m.groups())
+    if not rows:
+        return []
+    year = datetime.datetime.fromtimestamp(device_start, datetime.timezone.utc).year
+
+    def naive(stamp, y):
+        return datetime.datetime.strptime("%d %s" % (y, stamp), "%Y %b %d %H:%M:%S.%f").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+
+    first = naive(rows[0][0], year)
+    if first - device_start > 180 * 86400:     # 跨年
+        year -= 1
+        first = naive(rows[0][0], year)
+    tz = round((first - device_start) / 900) * 900
+    out = []
+    for stamp, proc, msg in rows:
+        try:
+            t = naive(stamp, year) - tz
+        except ValueError:
+            continue
+        out.append({"t": t, "conn": None, "category": "applog", "title": proc.strip(), "detail": msg})
+    return out
+
+
 def fmt_t(t, base):
     return "+%8.3fs" % (t - base) if base is not None else "%.3f" % t
 
@@ -621,7 +728,9 @@ def write_text(summary, path):
     base = summary["capture"]["first_ts"]
     out = io.StringIO()
     m = summary["meta"]
-    out.write("情境: %s | App: %s | 手機: %s\n" % (m.get("scenario", ""), m.get("app", ""), m.get("phone", "")))
+    out.write("情境: %s | 裝置: %s\n" % (m.get("scenario", ""), "、".join(
+        "%s %s%s" % (d.get("type", ""), d.get("name", ""), "（%s）" % d["app"] if d.get("app") else "")
+        for d in meta_devices(m)) or "-"))
     out.write("封包數: %d\n\n" % summary["capture"]["packets"])
     out.write("== 連線 ==\n")
     for c in summary["connections"]:
@@ -632,6 +741,11 @@ def write_text(summary, path):
             fmt_t(c["end"], base) if c["end"] else " (未結束)",
             "有" if c["gatt"] else "無", c["att_channel"] or "-", c["notifications"],
             c["disconnect_reason_text"] or "-", c["disconnect_by"] or "-"))
+    for c in summary["connections"]:
+        if c.get("interval_ms") is not None:
+            out.write("   #%d interval %.2f ms latency %d supervision %d ms%s\n" % (
+                c["id"], c["interval_ms"], c["latency"], c["supervision_ms"],
+                " 推估最後收到封包%s" % fmt_t(c["last_rx_estimate"], base) if c.get("last_rx_estimate") else ""))
     out.write("\n== 事件 ==\n")
     for e in summary["events"]:
         out.write("%s [%s] #%s %s %s\n" % (fmt_t(e["t"], base), e["category"],
@@ -667,6 +781,8 @@ def analyze(dirpath):
     marks = load_marks(os.path.join(dirpath, "marks.txt"))
     for mk in marks:
         an.events.append({"t": mk["t"], "conn": None, "category": "mark", "title": "標記", "detail": mk["text"]})
+    if meta.get("start_time") is not None and meta.get("clock_offset") is not None:
+        an.events.extend(load_journal(os.path.join(dirpath, "journal.log"), meta["start_time"] + meta["clock_offset"]))
     an.events.sort(key=lambda e: e["t"])
 
     before = load_keys(os.path.join(dirpath, "keys_before.tgz"))
@@ -680,6 +796,7 @@ def analyze(dirpath):
         "att_errors": an.att_errors,
         "marks": marks,
         "keys": {"before": before, "after": after, "diff": diff_keys(before, after)},
+        "adverts": an.adverts,
         "warnings": an.warnings,
     }
     with open(os.path.join(dirpath, "summary.json"), "w", encoding="utf-8") as f:

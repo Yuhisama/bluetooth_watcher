@@ -8,7 +8,12 @@
 <body>
 <header><h1>藍牙擷取工具</h1><span id="host-status"></span></header>
 <main>
-  <aside>
+  <aside id="sidebar">
+    <nav class="side-tabs" role="tablist">
+      <button id="tab-capture" role="tab" data-tab="capture">擷取<i class="tab-dot" hidden></i></button>
+      <button id="tab-records" role="tab" data-tab="records">紀錄</button>
+    </nav>
+    <div id="pane-capture" class="side-pane" role="tabpanel">
     <section class="panel" id="conn">
       <h2>儀表連線 <span id="conn-badge" class="badge unknown">未測試</span></h2>
       <div class="mark-row">
@@ -19,20 +24,24 @@
     </section>
     <section class="panel" id="control">
       <h2>擷取控制</h2>
-      <label>測試情境
-        <select id="scenario"></select>
-      </label>
-      <label>App
-        <select id="app">
-          <option>客戶App</option>
-          <option>nRF Connect</option>
-          <option>系統設定</option>
-        </select>
-      </label>
-      <label>手機
-        <input id="phone" list="phones" placeholder="例如 Galaxy M32 / iPhone">
-        <datalist id="phones"></datalist>
-      </label>
+      <fieldset id="capture-form" class="capture-form">
+        <label for="scenario">測試情境</label>
+        <div class="scenario-row">
+          <input id="scenario" list="scenario-list" maxlength="120" placeholder="自行輸入，或從清單挑選" autocomplete="off">
+          <button id="scenario-fav" type="button" title="加入／移出最愛">☆</button>
+        </div>
+        <datalist id="scenario-list"></datalist>
+        <div class="devices-head">
+          <span>裝置</span>
+          <select id="device-set" title="套用已存的裝置組合"><option value="">套用裝置組合…</option></select>
+          <button id="device-set-save" type="button" title="把目前的裝置存成組合">☆ 存組合</button>
+          <button id="device-set-delete" type="button" title="刪除選取的裝置組合" disabled>🗑</button>
+        </div>
+        <div id="devices" class="devices"></div>
+        <button id="device-add" type="button" class="device-add">＋ 新增裝置</button>
+        <datalist id="device-names"></datalist>
+        <datalist id="device-apps"></datalist>
+      </fieldset>
       <div class="buttons">
         <button id="btn-start" class="primary">開始擷取</button>
         <button id="btn-stop" class="danger" disabled>停止</button>
@@ -45,21 +54,23 @@
       <div id="state" class="state idle">閒置</div>
       <pre id="log"></pre>
     </section>
-    <section class="panel">
-      <h2>擷取紀錄</h2>
-      <div class="folder-actions">
-        <button id="folder-create">新增資料夾</button>
-        <button id="folder-rename" disabled>改名</button>
-        <button id="folder-delete" disabled>刪除資料夾</button>
+    </div>
+    <div id="pane-records" class="side-pane" role="tabpanel" hidden>
+      <div class="tree-toolbar">
+        <span>擷取紀錄</span>
+        <button id="tree-new-folder" title="新增資料夾">＋📁</button>
+        <button id="tree-collapse" title="全部收合">⊟</button>
       </div>
-      <div id="folders" class="folder-list" aria-label="分類資料夾"></div>
-      <p class="capture-help">雙擊名稱改名 · 拖曳紀錄到資料夾分類</p>
-      <ul id="captures"></ul>
-    </section>
+      <input id="tree-filter" type="search" placeholder="篩選：名稱、手機、App…" autocomplete="off">
+      <ul id="tree" class="tree" role="tree" tabindex="0" aria-label="擷取紀錄"></ul>
+      <p class="capture-help">右鍵開啟選單 · F2 改名 · Delete 刪除 · 拖曳移動</p>
+    </div>
   </aside>
+  <div id="resizer" class="resizer" title="拖曳調整側欄寬度"></div>
   <section id="result" class="panel">
     <p class="hint">選擇左側的擷取紀錄以檢視結果。</p>
   </section>
+  <section id="live" class="panel" hidden></section>
 </main>
 <dialog id="download-dialog" class="download-dialog" aria-labelledby="download-title">
   <form id="download-form">
@@ -77,6 +88,7 @@
     <div class="download-footer"><span id="download-status" aria-live="polite"></span><button type="button" id="download-cancel">取消</button><button type="submit" id="download-submit" class="primary">壓縮並下載</button></div>
   </form>
 </dialog>
+<ul id="ctx-menu" class="ctx-menu" role="menu" hidden></ul>
 <script src="app.js"></script>
 </body>
 </html>

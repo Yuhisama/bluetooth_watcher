@@ -59,6 +59,9 @@ device option 是 object path，但以 QVariant::toString() 取得
 | `20261021-112545` | GATT 查詢正常處理；第一次 BR 逾時，第二次加密後 0x0E | 證明 BR 異常不必以 GATT 拒絕為前提 |
 | `20261021-112909` | GATT 空裝置拒絕；BR 沒建成；LE 最後也逾時；firstConnection 忽略斷線 | GATT 現象相同；連線失敗收尾另追 |
 | `20261021-114736` | GATT 空裝置拒絕，但 LE／BR 與各 Classic Profile 維持成功 | 適合優先隔離、驗證應用層 GATT 問題 |
+| `20261021-135837`（Android 客戶APP配對(3) | 手機對儀表 GATT **完全沒有操作**（無探索、無 CCCD、無 Control Point）；BR 兩段式配對；無 LE 連線 | 不同問題，本計畫修正不影響，見第 7 節 |
+
+分析器顯示補強（已完成）：原本 `analyze.py` 對非 CCCD 的 ATT 寫入只計數、Notify 只統計數量，網頁上看不到 Control Point 查詢與 ACK。已新增 `gatt_write`、`notify` 事件（由特徵值探索封包解析 handle→UUID，並對應 Control Point／Data Source 名稱），網頁新增「GATT 寫入」區塊，Notify 分類預設不勾選。判讀方式：Notify 第一個 byte 為 `0x20` 即 Common ACK。
 
 已知分析器呈現問題：`analyze.py` 將 HCI `0x0E` 誤標為 Unacceptable BD_ADDR。正確為 Security Reasons，Unacceptable BD_ADDR 是 `0x0F`。此外，「前面沒有本機 Disconnect 命令」不代表逾時一定由手機主動發起，不能只憑 `remote` 標籤歸責。這些屬擷取工具的獨立後續項目，不納入本次應用程式根因修正。
 
@@ -96,7 +99,11 @@ Trusted 的完成時間只是初始化時序旁證。安全檢查沒有直接判
 
 ### 3.3 Android 與 nRF 為何沒有暴露同一條失敗路徑
 
-- Android：第一筆控制命令到達前，已完成該手機的 active 初始化。D-Bus 的 `link` 是 `BR/EDR`，不是 LE；命令正常進入 `processPacket()`，後續收到 `0x20` ACK 與 VIN／版本回覆。
+- Android：第一筆控制命令到達前，已完成該手機的 active 初始化（Bonded +1.4 s 提升 active，+3.3 s 才寫入）。D-Bus 的 `link` 是 `BR/EDR`，不是 LE；命令正常進入 `processPacket()`。
+  - 但第一輪查詢（`06 00 02`、`03 00 03`，+3.3 s）送出時手機**尚未訂閱 Notify**（CCCD 在 +4.3～5.4 s 才寫入），btmon 中該時段沒有任何 Notification，第一輪回覆實際上沒有送達。
+  - 約 14 秒後 App **自行重送**（`06 00 00`、`03 00 01`，+17.7 s／+18.3 s），這次收到 `20 0C 74 06 00`、`20 0C 76 03 01` ACK 與資料，App 才顯示成功。
+  - 整份擷取只有 4 筆 Notification，全部在第二輪之後。
+- iOS 與 Android 對照：兩者第一輪都沒拿到回覆（原因不同：iOS 被儀表拒絕；Android 是自己先寫後訂閱）。**Android App 有逾時重送，iOS App 沒有**，這是兩平台結果不同的直接原因；但 iOS 第一輪被拒是儀表端缺陷，屬本計畫修正對象。
 - nRF：沒有送 VIN／版本查詢，主要是較晚開啟、關閉自訂 Notify；它證明傳輸與訂閱可用，沒有驗證客戶 App 的初始化查詢。
 - 兩者的通訊路徑、操作順序都不同，不能直接推論 iOS OS 的配對安全性有缺陷。
 
@@ -183,11 +190,21 @@ GattCharacteristicAdaptor::WriteValue
 - 有提供但解析失敗時，不可自動當成未提供後借用其他 active 手機的授權。
 - 授權與拒絕 log 使用同一個已解析結果，避免診斷仍只顯示空字串。
 
+**注意：A 會改變所有手機的授權路徑。** 目前所有請求（含 Android）都因 `.toString()` 為空而走「缺少 device」備援，身分檢查實際上從未運作過。修正後每一筆寫入都會改走 `checkDeviceSecurity() && isActiveDeviceAddress()`。
+
+- `isActiveDeviceAddress()`（`bluetooth_manager.cpp:1927`）會從路徑取 `dev_` 後段，再與 `address()`／`publicAddress()` 比對。已用紀錄確認：iOS 首次配對與換 RPA（`6A:B6…`、`72:D6…`）時，app 記錄的 `address()` 與 D-Bus 路徑一致；Android BR GATT 路徑為 BR 位址，與 `address()` 相同。
+- 仍須回歸：同一手機的 LE 與 BR 在 BlueZ 中為兩個獨立物件時、開機自動重連、雙手機切換。
+- `checkDeviceSecurity()` 的 Paired／Connected 檢查與 BlueZ `secure-write` 已保證的條件重疊，每次寫入會多兩次同步 D-Bus 查詢。本次不強制修改，僅記錄。
+
 ### 6.3 B：讓已接受、已 bonding 且已連線的首次配對候選者可執行 GATT
 
 修改範圍：`bluetooth_manager.h/.cpp` 與 GATT 授權呼叫點。
 
-預定採取「精確辨識請求者，允許安全的首次配對候選者」的窄範圍方案。概念上的授權來源為：
+**本節有兩個候選方案，待使用者決定：B1（原案，候選者授權）或 B2（Bonded 事件立即提升 active）。**
+
+#### B1：GATT 授權接受首次配對候選者（原案）
+
+採取「精確辨識請求者，允許安全的首次配對候選者」的窄範圍方案。概念上的授權來源為：
 
 | 狀態 | 預定判斷 |
 |---|---|
@@ -200,13 +217,27 @@ GattCharacteristicAdaptor::WriteValue
 
 候選者授權與正式 active／音訊就緒分開處理，不為了解決兩筆查詢而提早切換整個 active slot。實作前需核對候選者 weak_ptr、配對接受旗標、位址別名與舊手機清理條件，確保不跨 session 授權。
 
+#### B2：Bonded 事件立即執行「提升 active」（替代案）
+
+- 觀察：`updateDevicesStatus()` 中 `m_currentConnectingTarget` → `m_activeTarget` 的提升邏輯（`bluetooth_manager.cpp:755-800`）本來就會在 Bonded 後 0～3 秒由輪詢執行；iOS 紀錄中即 Bonded 15.116 → 提升 16.723。
+- 做法：把這段提升邏輯抽成 helper，輪詢與 `onDevicePaired()`（`:563`，目前只有 log）共用；Bonded 事件到達且裝置等於 `m_currentConnectingTarget`、已接受配對時立即執行一次。
+- 授權規則維持只有「active」一套，GATT 授權程式不需要新增候選者概念。
+- 實作前須核對：
+  - 從 signal slot 呼叫時 `resetUpdateMainParameter()`、`setTrusted()`、`saveSlotsToConfig()`、`emit activateSlotStateChanged()` 的重入安全性。
+  - 提升只能執行一次，輪詢路徑需因 `m_currentConnectingTarget` 已清除而自然跳過。
+  - BR-first 情境（Android）與 LE-first 情境（iOS）的 `m_pairingBearer`／`m_leClassicConnectEnabled` 判斷不受提前影響。
+
+#### 共同邊界
+
+理論上 ATT 寫入可能在加密完成後、Bonded 屬性通知之前到達。本次紀錄順序為 Bonded 15.116 → 第一筆寫入 15.411，未發生；B1、B2 都無法完全排除此情況，C 的正確錯誤回覆可作為兜底。
+
 #### 方案取捨
 
 | 方案 | 優點 | 缺點／限制 | 決定 |
 |---|---|---|---|
 | 只修 object path | 改動最小，身分解析正確 | `isActiveDeviceAddress()` 仍會拒絕尚未 active 的首次手機 | 必做，但不足以單獨解決 |
-| 在 GATT 授權辨識安全的已接受候選者 | 直接解除不必要的輪詢依賴，不改音訊 active 流程 | 需精確約束候選身分、接受狀態及舊連線清理 | 預定主方案 |
-| 配對事件立即推進整個 active 狀態機 | 可縮短狀態延遲 | 牽動 Classic 補連、音訊、slot 與回呼重入，影響範圍較大 | 本次不優先 |
+| B1：GATT 授權辨識安全的已接受候選者 | 不動 active／音訊狀態機 | 新增第二套授權條件（已接受、bonded、已連線、無舊 slot 衝突），須長期與 active 規則保持一致，安全面變大 | 候選 |
+| B2：Bonded 事件立即執行既有提升邏輯 | 授權規則只有一套；只改變時機、不改變行為；其他依賴 active 的流程也同步提前 | 須確認 signal slot 中執行的重入安全性，以及避免重複提升 | 候選（建議） |
 | 手機固定延遲幾秒再寫 | 可用來佐證時序 | 依機器負載及輪詢相位而變，不是可靠的儀表根因修正 | 不作正式解法 |
 | 只依 secure flags 放行所有寫入 | 簡單 | 失去應用層單手機身分隔離 | 不採用 |
 
@@ -220,6 +251,9 @@ GattCharacteristicAdaptor::WriteValue
 - 安全拒絕與處理例外應分開記錄；不能對所有例外都謊稱為認證問題。
 - 現有程式註解指出過去 `setDelayedReply` 有崩潰經驗，不能直接恢復未確認的舊做法。
 - 實作時先確認 Qt 6.8 上 adaptor 的 D-Bus context 是否可用，必要時使用 Qt 支援的原始 message 回覆機制；不把未驗證的 QDBusContext／延遲回覆方案視為已可用。
+  - 依 Qt D-Bus 的分派方式，context 設在實際被呼叫的物件上；以 adaptor 匯出時即 `GattCharacteristicAdaptor` 本身，因此應由 adaptor 繼承 `QDBusContext`，在 slot 內同步 `sendErrorReply()`，不需要 `setDelayedReply`。
+- **ATT 錯誤碼對手機的影響須實機確認**：BlueZ 會把 `org.bluez.Error.NotAuthorized` 轉為 ATT 0x08（Insufficient Authorization），`org.bluez.Error.NotPermitted` 轉為 Write Not Permitted。部分手機（特別是 iOS）收到驗證／授權類錯誤時可能觸發重新配對或進入不同錯誤流程。實機觀察後再決定使用哪一個。
+- C 是正確性修正；修正後被拒的情況應極少，不能預期單靠 C 讓 App 恢復成功。
 
 ### 6.5 D：最小診斷資訊
 
@@ -234,6 +268,12 @@ GattCharacteristicAdaptor::WriteValue
 - CAN `0x512` timeout 的來源與手機收到 CAN error 時的行為。
 - VIN 資料來自 CAN 的內容有效性、版本格式，以及手機 App 的內部失敗判定。
 - 擷取分析器的錯誤碼文字及斷線發起方推斷修正。
+- **Android 客戶APP配對(3)（`20261021-135837`）**：另案追查，本計畫 A／B／C 不會改善此情況。
+  - 現象：BR 先做一次 AuthReq=0x00 的無 MITM、不 bonding 配對（Unauthenticated Link Key type 7），+7.55 s 手機即開啟 BR ATT 通道；約 13 秒後再做 General Bonding + MITM 配對（type 8）。整份紀錄手機對儀表沒有任何 ATT Request，D-Bus `WriteValue`／`StartNotify`／`ReadValue` 皆 0 筆；無 LE 連線；Classic 音訊正常；App 顯示失敗。
+  - 與成功的 Android(1) 差異：(1) 只有一次 Dedicated Bonding + MITM 配對，ATT 通道在驗證配對之後開啟，接著立即探索與寫入。
+  - 推論（缺手機端資料）：App 可能在無驗證配對階段就嘗試 GATT 而於手機端失敗；或 App 改走 LE，但儀表在 Bonded 後（+26 s）即關閉 LE 廣播。需手機端 `btsnoop_hci.log` 或 App log 確認。
+  - 尚未比對：`20261021-135248`（catalog 名稱「客戶 APP 配對(2」，Android）是否為相同現象。
+- 客戶 App 端行為（僅回報，不在儀表修正範圍）：iOS 版缺少查詢逾時重送；Android 版先寫 Control Point 後訂閱 Notify，第一輪回覆必然遺失。
 
 ## 8. 驗證與驗收條件
 
@@ -248,7 +288,10 @@ GattCharacteristicAdaptor::WriteValue
 | 已提供但解析失敗／非目標手機 | 拒絕，D-Bus 與 ATT 顯示合理錯誤；不得借用其他手機 active 狀態放行 |
 | 未接受配對／未 bonding／已斷線 | 不可因是候選者就提早允許 |
 | 舊 slot 尚未清乾淨 | 不可提前授權新的候選 session |
-| Android 原本 BR/EDR GATT 成功案例 | 控制命令、ACK、VIN／版本回覆及 Classic 音訊行為維持正常 |
+| Android 原本 BR/EDR GATT 成功案例 | 控制命令、ACK、VIN／版本回覆及 Classic 音訊行為維持正常；因 A 改變授權路徑，log 應顯示完整裝置路徑且比對 active 成功 |
+| 開機自動重連（iOS 換 RPA、Android） | 重連後的 Control Point 寫入能通過 `isActiveDeviceAddress(path)` |
+| 被拒絕時 iOS／Android 的反應 | 記錄收到 ATT 0x08（或所選錯誤碼）後手機是否觸發重新配對、斷線或 App 錯誤，作為錯誤碼選擇依據 |
+| B2 採用時 | Bonded 事件後立即看到提升 active 的 log，輪詢不再重複提升；Classic 補連、音訊、slot 狀態與原本一致 |
 | nRF Connect | 一般探索及訂閱正常；在安全連線完成後手動送同樣 VIN／版本命令，確認也能處理 |
 | 兩個已記憶手機與 FOB | 非目標手機／FOB 不得因本次候選授權而取得控制通道 |
 | 正常／拒絕路徑 | 一次請求只有一次 D-Bus 回覆，沒有重複回覆、context 錯誤或崩潰 |
@@ -265,7 +308,9 @@ GattCharacteristicAdaptor::WriteValue
 - [x] 追到 GATT 安全拒絕、active 提升時序與正常 D-Bus 回覆的程式位置。
 - [x] 確認 VIN／版本命令與序號、CAN timeout 通知的協定定義。
 - [x] 保存問題、證據、推斷及預定修改方案。
-- [ ] 使用者確認修改範圍與候選授權方案。
+- [x] 補充 nRF(2)、Android nRF、Android 客戶 App 重送行為與 Android(3) 不同現象。
+- [x] 分析器新增 GATT 寫入／Notify 事件顯示。
+- [ ] 使用者確認修改範圍，並在 B1／B2 之間選定。
 - [ ] 實作 A／B／C／D，維持修改集中於 GATT 與必要的 Manager 授權 helper。
 - [ ] 使用者編譯、部署並回傳新的首次配對擷取。
 - [ ] 依第 8 節確認 iOS 修正結果及 Android／單手機限制回歸。

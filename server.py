@@ -15,6 +15,8 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, unquote
 
+import analyze
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CAP_ROOT = os.environ.get("BTCAP_DIR", os.path.join(HERE, "captures"))
 WEB = os.path.join(HERE, "web")
@@ -237,6 +239,42 @@ def current_capture():
             "elapsed": time.time() - meta.get("start_time", time.time())}
 
 
+# ---------- 即時擷取 ----------
+LIVE_INTERVAL = 1.5
+live_lock = threading.Lock()
+live_cache = {"id": None, "at": 0.0, "summary": None}
+
+
+def live_summary():
+    """擷取中：拉回儀表端新增的資料到 captures/.live 並分析；同一時間只跑一次，結果快取 1.5 秒。"""
+    cur = current_capture()
+    if not cur:
+        return None
+    with live_lock:
+        if live_cache["id"] == cur["id"] and time.time() - live_cache["at"] < LIVE_INTERVAL:
+            return live_cache["summary"]
+        d = os.path.join(CAP_ROOT, ".live")
+        if live_cache["id"] != cur["id"]:
+            shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+        meta = os.path.join(CAP_ROOT, cur["id"], "meta.json")
+        if os.path.exists(meta):
+            shutil.copy(meta, d)
+        fetch_error = None
+        try:
+            run_capture("live", d, timeout=20)
+        except RuntimeError as e:
+            fetch_error = "即時資料拉回失敗: %s" % e
+        summary = analyze.analyze(d)
+        # 擷取中檔案尾端常是寫到一半的封包，下次拉回就會補齊
+        summary["warnings"] = [w for w in summary["warnings"] if "結尾不完整" not in w and "找不到 hci.btsnoop" not in w]
+        if fetch_error:
+            summary["warnings"].append(fetch_error)
+        summary["live"] = {"id": cur["id"], "elapsed": cur["elapsed"]}
+        live_cache.update(id=cur["id"], at=time.time(), summary=summary)
+        return summary
+
+
 def list_captures():
     items = []
     with lock:
@@ -314,32 +352,160 @@ def update_organization(cid, body):
             raise ValueError("無效的分類資料夾")
         if folder != "" and folder not in {f["id"] for f in catalog["folders"]}:
             raise ValueError("找不到分類資料夾")
-        catalog["captures"][cid] = {"name": name, "folder": folder}
+        device_map = dict(item.get("device_map", {}))
+        changes = body.get("device_map", {})
+        if not isinstance(changes, dict):
+            raise ValueError("無效的裝置對應")
+        for key, index in changes.items():
+            if index is None:
+                device_map.pop(key, None)
+            elif isinstance(index, int) and not isinstance(index, bool) and -1 <= index < MAX_DEVICES:
+                device_map[key] = index
+            else:
+                raise ValueError("無效的裝置對應")
+        item = {"name": name, "folder": folder}
+        if device_map:
+            item["device_map"] = device_map
+        catalog["captures"][cid] = item
         save_catalog(catalog)
-    return {"name": name, "folder": folder}
+    return item
+
+
+def folder_parent(folders, value):
+    if not isinstance(value, str) or (value and value not in {f["id"] for f in folders}):
+        raise ValueError("找不到上層資料夾")
+    return value
+
+
+# ---------- 情境最愛、裝置組合 ----------
+MAX_DEVICES = 10
+DEFAULT_DEVICE_TYPES = ["手機", "MOB/FOB", "耳機", "其他"]
+
+
+def clean_text(value, limit=120):
+    if not isinstance(value, str) or len(value.strip()) > limit:
+        raise ValueError("文字欄位需為 %d 字以內" % limit)
+    return value.strip()
+
+
+def clean_devices(devices):
+    if not isinstance(devices, list) or len(devices) > MAX_DEVICES:
+        raise ValueError("裝置清單最多 %d 個" % MAX_DEVICES)
+    out = []
+    for d in devices:
+        if not isinstance(d, dict):
+            raise ValueError("無效的裝置")
+        dev = {k: clean_text(d.get(k, "")) for k in ("type", "name", "app", "address")}
+        if dev["type"] or dev["name"]:
+            out.append(dev)
+    return out
+
+
+def clean_names(values):
+    if not isinstance(values, list) or len(values) > 200:
+        raise ValueError("清單項目過多")
+    names = [clean_text(v) for v in values]
+    return list(dict.fromkeys(n for n in names if n))
+
+
+def presets_path():
+    return os.path.join(CAP_ROOT, ".presets.json")
+
+
+def load_presets():
+    try:
+        with open(presets_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    return {"favorites": data.get("favorites", []), "device_sets": data.get("device_sets", []),
+            "device_types": data.get("device_types") or DEFAULT_DEVICE_TYPES,
+            "last_devices": data.get("last_devices", [])}
+
+
+def save_presets(presets):
+    os.makedirs(CAP_ROOT, exist_ok=True)
+    with open(presets_path() + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(presets, f, ensure_ascii=False, indent=2)
+    os.replace(presets_path() + ".tmp", presets_path())
+
+
+def update_presets(body):
+    # 只更新有送出的欄位；每個欄位整份取代
+    with lock:
+        presets = load_presets()
+        if "favorites" in body:
+            presets["favorites"] = clean_names(body["favorites"])
+        if "device_types" in body:
+            presets["device_types"] = clean_names(body["device_types"]) or DEFAULT_DEVICE_TYPES
+        if "device_sets" in body:
+            sets = body["device_sets"]
+            if not isinstance(sets, list) or len(sets) > 100:
+                raise ValueError("裝置組合過多")
+            cleaned = {}
+            for item in sets:
+                if not isinstance(item, dict):
+                    raise ValueError("無效的裝置組合")
+                cleaned[display_name(item.get("name"))] = clean_devices(item.get("devices", []))
+            presets["device_sets"] = [{"name": k, "devices": v} for k, v in cleaned.items()]
+        if "last_devices" in body:
+            presets["last_devices"] = clean_devices(body["last_devices"])
+        save_presets(presets)
+        return presets
+
+
+def start_capture(body):
+    scenario = clean_text(body.get("scenario") or "") or "未指定"
+    devices = clean_devices(body.get("devices", []))
+    fd, path = tempfile.mkstemp(prefix=".start-meta-", suffix=".json", dir=HERE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"devices": devices}, f, ensure_ascii=False)
+        out = run_capture("start", scenario, "--meta", path)
+    finally:
+        os.unlink(path)
+    update_presets({"last_devices": devices})
+    return out
 
 
 def edit_folder(action, body):
+    # 資料夾以 parent 形成樹；"" 為根目錄。擷取目錄本身不移動。
     with lock:
         catalog = load_catalog()
         folders = catalog["folders"]
+        for f in folders:
+            f.setdefault("parent", "")
         folder = next((f for f in folders if f["id"] == body.get("id")), None)
         if action != "create" and folder is None:
             raise ValueError("找不到分類資料夾")
         if action == "delete":
+            # 子資料夾與紀錄移到被刪資料夾的上一層，擷取檔案保留。
             folders.remove(folder)
+            for f in folders:
+                if f["parent"] == folder["id"]:
+                    f["parent"] = folder["parent"]
             for item in catalog["captures"].values():
                 if item.get("folder") == folder["id"]:
-                    item["folder"] = ""
+                    item["folder"] = folder["parent"]
         else:
-            name = display_name(body.get("name"))
-            if any(f["name"] == name and f is not folder for f in folders):
-                raise ValueError("已存在同名資料夾")
+            if action == "move":
+                name = folder["name"]
+                parent = folder_parent(folders, body.get("parent"))
+                ancestor = parent
+                while ancestor:
+                    if ancestor == folder["id"]:
+                        raise ValueError("不能移到自己或子資料夾內")
+                    ancestor = next(f["parent"] for f in folders if f["id"] == ancestor)
+            else:
+                name = display_name(body.get("name"))
+                parent = folder_parent(folders, body.get("parent", "")) if action == "create" else folder["parent"]
+            if any(f["name"] == name and f["parent"] == parent and f is not folder for f in folders):
+                raise ValueError("同一層已存在同名資料夾")
             if action == "create":
-                folder = {"id": uuid.uuid4().hex, "name": name}
+                folder = {"id": uuid.uuid4().hex, "name": name, "parent": parent}
                 folders.append(folder)
             else:
-                folder["name"] = name
+                folder["name"], folder["parent"] = name, parent
         save_catalog(catalog)
         return folder
 
@@ -413,6 +579,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             cur = current_capture()
             return self.send_json({"state": "capturing" if cur else "idle", "current": cur})
+        if path == "/api/live":
+            summary = live_summary()
+            return self.send_json({"capturing": summary is not None, "summary": summary})
+        if path == "/api/presets":
+            with lock:
+                presets = load_presets()
+            return self.send_json(presets)
         if path == "/api/captures":
             return self.send_json(list_captures())
         if path == "/api/folders":
@@ -470,7 +643,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     shutil.copyfileobj(output, self.wfile)
                 return
-            m = re.fullmatch(r"/api/folders/(create|rename|delete)", path)
+            m = re.fullmatch(r"/api/folders/(create|rename|move|delete)", path)
             if m:
                 folder = edit_folder(m.group(1), body)
                 return self.send_json({"ok": True, "folder": folder})
@@ -497,9 +670,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True, "test": test_connection(host)})
             if path == "/api/start":
                 with capture_lock:
-                    out = run_capture("start", body.get("scenario") or "未指定",
-                                      body.get("app", ""), body.get("phone", ""))
+                    out = start_capture(body)
                 return self.send_json({"ok": True, "output": out})
+            if path == "/api/presets":
+                return self.send_json({"ok": True, "presets": update_presets(body)})
             if path == "/api/mark":
                 with capture_lock:
                     out = run_capture("mark", body.get("text", ""), timeout=15)

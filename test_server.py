@@ -115,6 +115,114 @@ class OrganizationTests(unittest.TestCase):
         self.request("/captures/missing/organization", {"name": "test"}, 500)
         self.assertEqual(server.load_catalog(), before)
 
+    def test_nested_folders_move_and_delete(self):
+        parent = self.create_folder("Android")
+        child = self.request("/folders/create", {"name": "首次配對", "parent": parent["id"]})["folder"]
+        self.assertEqual(child["parent"], parent["id"])
+        # 同名只限制在同一層
+        self.request("/folders/create", {"name": "首次配對"})
+        self.request("/folders/create", {"name": "首次配對", "parent": parent["id"]}, 500)
+        self.request("/folders/create", {"name": "x", "parent": "missing"}, 500)
+        self.organize("M32", child["id"])
+        before = server.load_catalog()
+        self.request("/folders/move", {"id": parent["id"], "parent": child["id"]}, 500)
+        self.request("/folders/move", {"id": parent["id"], "parent": parent["id"]}, 500)
+        self.assertEqual(server.load_catalog(), before)
+        self.request("/folders/move", {"id": child["id"], "parent": ""}, 500)  # 根目錄已有同名
+        sibling = self.create_folder("iPhone")
+        self.request("/folders/move", {"id": child["id"], "parent": sibling["id"]})
+        self.request("/folders/move", {"id": child["id"], "parent": parent["id"]})
+        self.request("/folders/rename", {"id": child["id"], "name": "回連"})
+        self.assertEqual(next(f for f in self.request("/folders") if f["id"] == child["id"])["parent"], parent["id"])
+        grandchild = self.request("/folders/create", {"name": "第二次", "parent": child["id"]})["folder"]
+        # 刪除資料夾：子資料夾與紀錄移到上一層
+        self.request("/folders/delete", {"id": child["id"]})
+        self.assertEqual(self.request("/captures")[0]["folder"], parent["id"])
+        self.assertEqual(next(f for f in self.request("/folders") if f["id"] == grandchild["id"])["parent"], parent["id"])
+        self.assertEqual((self.capture / "btmon.out").read_text(), "original capture")
+
+    def test_presets_favorites_and_device_sets(self):
+        presets = self.request("/presets")
+        self.assertEqual(presets["favorites"], [])
+        self.assertEqual(presets["device_types"], server.DEFAULT_DEVICE_TYPES)
+        saved = self.request("/presets", {"favorites": [" 首次配對 ", "回連", "首次配對", ""]})["presets"]
+        self.assertEqual(saved["favorites"], ["首次配對", "回連"])
+        devices = [{"type": "手機", "name": "iPhone 12", "app": "客戶App"}, {"type": "MOB/FOB", "name": "FOB #2"}, {"type": "", "name": ""}]
+        saved = self.request("/presets", {"device_sets": [{"name": "iPhone + FOB", "devices": devices}]})["presets"]
+        self.assertEqual(saved["favorites"], ["首次配對", "回連"])
+        self.assertEqual(saved["device_sets"][0]["devices"],
+                         [{"type": "手機", "name": "iPhone 12", "app": "客戶App", "address": ""},
+                          {"type": "MOB/FOB", "name": "FOB #2", "app": "", "address": ""}])
+        before = self.request("/presets")
+        self.request("/presets", {"favorites": "not a list"}, 500)
+        self.request("/presets", {"device_sets": [{"name": "", "devices": []}]}, 500)
+        self.request("/presets", {"device_sets": [{"name": "x", "devices": [{"name": "y" * 121}]}]}, 500)
+        self.assertEqual(self.request("/presets"), before)
+
+    def test_start_passes_devices_and_remembers_them(self):
+        seen = {}
+
+        def fake_run(*args, **kwargs):
+            seen["args"] = args
+            with open(args[3], encoding="utf-8") as f:
+                seen["meta"] = json.load(f)
+            return "started"
+
+        devices = [{"type": "手機", "name": "Galaxy M32", "app": "nRF Connect"}, {"type": "耳機", "name": ""}]
+        with patch.object(server, "run_capture", fake_run):
+            self.request("/start", {"scenario": " 我自己填的情境 ", "devices": devices})
+            self.request("/start", {"scenario": "x", "devices": [{"name": "z"}] * 11}, 500)
+        self.assertEqual(seen["args"][:3], ("start", "我自己填的情境", "--meta"))
+        self.assertFalse(Path(seen["args"][3]).exists(), "暫存 meta 檔用完要刪除")
+        expected = [{"type": "手機", "name": "Galaxy M32", "app": "nRF Connect", "address": ""},
+                    {"type": "耳機", "name": "", "app": "", "address": ""}]
+        self.assertEqual(seen["meta"], {"devices": expected})
+        self.assertEqual(self.request("/presets")["last_devices"], expected)
+
+    def test_device_map_is_saved_with_organization(self):
+        path = "/captures/%s/organization" % self.capture.name
+        self.organize("M32")
+        self.request(path, {"device_map": {"A8:91:3D:E8:E4:F2": 0, "72:D6:37:A5:22:4D": -1}})
+        org = self.request("/captures")[0]
+        self.assertEqual(org["device_map"], {"A8:91:3D:E8:E4:F2": 0, "72:D6:37:A5:22:4D": -1})
+        self.assertEqual(org["name"], "M32")
+        self.request(path, {"device_map": {"72:D6:37:A5:22:4D": None}})
+        self.assertEqual(self.request("/captures")[0]["device_map"], {"A8:91:3D:E8:E4:F2": 0})
+        before = server.load_catalog()
+        for bad in ({"x": 10}, {"x": -2}, {"x": "0"}, {"x": True}, []):
+            self.request(path, {"device_map": bad}, 500)
+        self.assertEqual(server.load_catalog(), before)
+        self.request(path, {"device_map": {"A8:91:3D:E8:E4:F2": None}})
+        self.assertNotIn("device_map", self.request("/captures")[0])
+
+    def test_live_fetches_incrementally_and_caches(self):
+        self.assertEqual(self.request("/live"), {"capturing": False, "summary": None})
+        (self.root / ".current").write_text(str(self.capture))
+        (self.capture / "meta.json").write_text(json.dumps({"scenario": "FOB 走遠", "devices": [{"type": "MOB/FOB", "name": "FOB"}]}))
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            with open(Path(args[1]) / "hci.btsnoop", "wb") as f:
+                f.write(b"btsnoop\0" + (1).to_bytes(4, "big") + (2001).to_bytes(4, "big"))
+            return ""
+
+        with patch.object(server, "run_capture", fake_run):
+            live = self.request("/live")
+            self.assertTrue(live["capturing"])
+            self.assertEqual(live["summary"]["live"]["id"], self.capture.name)
+            self.assertEqual(live["summary"]["meta"]["scenario"], "FOB 走遠")
+            self.assertEqual(live["summary"]["warnings"], [])
+            self.request("/live")
+            self.assertEqual(len(calls), 1, "1.5 秒內重複查詢使用快取")
+            self.assertEqual(calls[0][:2], ("live", str(self.root / ".live")))
+            server.live_cache["at"] = 0
+            with patch.object(server, "run_capture", side_effect=RuntimeError("ssh 中斷")):
+                live = self.request("/live")
+            self.assertIn("即時資料拉回失敗: ssh 中斷", live["summary"]["warnings"])
+        self.assertEqual([c["id"] for c in self.request("/captures")], [self.capture.name], ".live 不出現在紀錄清單")
+        server.live_cache.update(id=None, at=0.0, summary=None)
+
     def test_incomplete_capture_can_be_organized_and_deleted(self):
         (self.capture / "meta.json").unlink()
         self.organize("失敗紀錄")

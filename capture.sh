@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # 透過 SSH 在儀表端擷取藍牙資料。
 #   capture.sh start <scenario> <app> <phone>
+#   capture.sh start <scenario> --meta <json>   （json 內的欄位併入 meta.json，例如 devices）
 #   capture.sh mark "<text>"
 #   capture.sh stop
 #   capture.sh force-stop
 #   capture.sh status
+#   capture.sh live <dir>   （擷取中把儀表端新增的資料追加到 <dir>，供即時分析）
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,8 +55,14 @@ snapshot() {
 }
 
 cmd_start() {
-    [ $# -ge 1 ] || die "用法: capture.sh start <scenario> [app] [phone]"
-    local scenario="$1" app="${2:-}" phone="${3:-}"
+    [ $# -ge 1 ] || die "用法: capture.sh start <scenario> [app] [phone] | start <scenario> --meta <json>"
+    local scenario="$1" app="" phone="" extra=""
+    if [ "${2:-}" = "--meta" ]; then
+        extra="${3:-}"
+        [ -f "$extra" ] || die "找不到 meta 檔: $extra"
+    else
+        app="${2:-}" phone="${3:-}"
+    fi
     [ -f "$CURRENT" ] && die "已有擷取進行中: $(cat "$CURRENT")，請先 stop"
 
     rsh true || die "無法 SSH 到 $HOST（請先設定 ssh-copy-id）"
@@ -73,8 +81,9 @@ cmd_start() {
     kill_strays
 
     local safe dir
-    safe=$(printf '%s' "$scenario" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-40)
-    dir="$CAP_ROOT/$(date +%Y%m%d-%H%M%S)_$safe"
+    # 非英數字（例如中文）會變成底線；壓縮連續底線，全是底線就只用時間當名稱
+    safe=$(printf '%s' "$scenario" | tr -c 'A-Za-z0-9_-' '_' | tr -s '_' | sed 's/^_//; s/_$//' | cut -c1-40)
+    dir="$CAP_ROOT/$(date +%Y%m%d-%H%M%S)${safe:+_$safe}"
     mkdir -p "$dir"
     # 啟動途中失敗就刪掉這個目錄，避免留下沒有 meta.json 的殘骸
     trap "rm -rf '$dir'" EXIT
@@ -111,8 +120,21 @@ EOF
     dead=$(rsh "for p in \$(cat $REMOTE_DIR/pids); do kill -0 \$p 2>/dev/null || echo \$p; done")
     [ -z "$dead" ] || echo "警告: 部分擷取程式未正常啟動（pid $dead），請檢查儀表 $REMOTE_DIR/*.out/*.log" >&2
 
-    json_meta scenario "$scenario" app "$app" phone "$phone" host "$HOST" \
-        start_time "$t0" clock_offset "$offset" > "$dir/meta.json"
+    if [ -n "$extra" ]; then
+        json_meta scenario "$scenario" host "$HOST" start_time "$t0" clock_offset "$offset" > "$dir/meta.json"
+        python3 - "$dir/meta.json" "$extra" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    meta = json.load(f)
+with open(sys.argv[2], encoding="utf-8") as f:
+    meta.update({k: v for k, v in json.load(f).items() if k not in meta})
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(meta, f, ensure_ascii=False, indent=2)
+PY
+    else
+        json_meta scenario "$scenario" app "$app" phone "$phone" host "$HOST" \
+            start_time "$t0" clock_offset "$offset" > "$dir/meta.json"
+    fi
     echo "$dir" > "$CURRENT"
     trap - EXIT
     echo "$dir"
@@ -216,6 +238,19 @@ cmd_force_stop() {
     fi
 }
 
+# btsnoop 與 journal 只會往後追加，只拉回本機還沒有的部分
+cmd_live() {
+    local dest="${1:-}" f have
+    [ -n "$dest" ] || die "用法: capture.sh live <dir>"
+    [ -f "$CURRENT" ] || die "目前沒有擷取進行中"
+    mkdir -p "$dest"
+    for f in hci.btsnoop journal.log; do
+        have=$(stat -c %s "$dest/$f" 2>/dev/null || echo 0)
+        rsh "tail -c +$((have + 1)) $REMOTE_DIR/$f 2>/dev/null" >> "$dest/$f" || true
+    done
+    rsh "cat $REMOTE_DIR/marks.txt 2>/dev/null" > "$dest/marks.txt" || true
+}
+
 cmd_status() {
     if [ -f "$CURRENT" ]; then echo "capturing $(cat "$CURRENT")"; else echo "idle"; fi
 }
@@ -227,5 +262,6 @@ case "${1:-}" in
     stop)   shift; cmd_stop ;;
     force-stop) shift; cmd_force_stop ;;
     status) cmd_status ;;
-    *) die "用法: capture.sh {start <scenario> [app] [phone] | mark <text> | stop | force-stop | status}" ;;
+    live)   shift; cmd_live "$@" ;;
+    *) die "用法: capture.sh {start <scenario> [app] [phone] | start <scenario> --meta <json> | mark <text> | stop | force-stop | status | live <dir>}" ;;
 esac
